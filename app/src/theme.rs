@@ -347,6 +347,12 @@ pub fn date_time(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// `2026-11-18 20:57` (local time, no seconds).
+pub fn date_time_short(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms).single().map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
+}
+
 pub fn short_version(v: &str) -> String {
     if v.len() >= 40 && v[..40].chars().all(|c| c.is_ascii_hexdigit()) {
         format!("{}{}", &v[..7], &v[40..])

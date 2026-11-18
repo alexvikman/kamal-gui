@@ -247,7 +247,8 @@ pub fn lookup(reference: &str, account: &str) -> Result<String> {
 ///
 /// Returns None if nothing changed.
 pub fn migrate_legacy(text: &str) -> Option<String> {
-    let assign = regex::Regex::new(r"^([A-Z_][A-Z0-9_]*)=([^\s$()]+)\s*$").unwrap();
+    // `NAME=value` or `export NAME=value` (literal values only).
+    let assign = regex::Regex::new(r"^(?:export\s+)?([A-Z_][A-Z0-9_]*)=([^\s$()]+)\s*$").unwrap();
     let vars: HashMap<&str, &str> = text
         .lines()
         .filter_map(|l| assign.captures(l.trim()))
@@ -309,6 +310,12 @@ mod tests {
         assert_eq!(refs[0].item, "app");
         assert_eq!(refs[1].to_string(), "op://deploy/docker-hub/PW");
         assert!(refs[0].env_key().starts_with("KGUI_SECRET_6F703A2F2F"));
+    }
+
+    #[test]
+    fn migrate_drops_unused_exported_helper_vars() {
+        let t = "export OP_ACCOUNT=example.1password.com\nX=$(bash ~/scripts/op-read-item-field app KEY deploy)\n";
+        assert_eq!(migrate_legacy(t).unwrap(), "X=$(kgui secret op://deploy/app/KEY)\n");
     }
 
     #[test]

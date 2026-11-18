@@ -7,7 +7,7 @@ use kgui_core::config::UnitConfig;
 use kgui_core::git::{self, RefList};
 use kgui_core::history::Run;
 use kgui_core::images;
-use kgui_core::kamal::Action;
+use kgui_core::kamal::{AccessoryVerb, Action};
 use kgui_core::project::{self, ProjectDetail, Target, Unit};
 use kgui_core::status::{self, Container, ProjectStatus};
 use std::collections::{BTreeSet, HashMap};
@@ -74,7 +74,9 @@ impl ProjectView {
         let n = v.name.clone();
         v.load = Some(Task::spawn(ctx, move || project::load_detail(project::find(&n)?)));
         v.load_refs(ctx);
-        v.refresh_status(ctx);
+        // GitHub first; the server check starts when the fetch is done (see
+        // `poll`). The SSH agent then asks for its keys in a fixed order,
+        // one at a time.
         v.fetch_origin(ctx);
         v
     }
@@ -132,7 +134,9 @@ impl ProjectView {
             Some(Err(e)) => self.error = Some(e),
             None => {}
         }
-        match task::poll(&mut self.fetch) {
+        let fetched = task::poll(&mut self.fetch);
+        let fetch_finished = fetched.is_some();
+        match fetched {
             Some(Ok(d)) => {
                 self.detail = Some(d);
                 self.fetched_at = Some(chrono::Utc::now().timestamp_millis());
@@ -140,6 +144,9 @@ impl ProjectView {
             }
             Some(Err(e)) => self.error = Some(format!("Fetching from origin failed: {e}")),
             None => {}
+        }
+        if fetch_finished && self.status.is_none() && self.status_task.is_none() {
+            self.refresh_status(ctx);
         }
         match task::poll(&mut self.refs_task) {
             Some(Ok(r)) => self.refs = Some(r),
@@ -523,21 +530,58 @@ fn unit_row(ui: &mut Ui, p: &Palette, unit: &Unit, cx: &UnitCtx, requests: &mut 
                 });
             }
         });
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            unit_menu(ui, unit, cx, &service, requests);
-            ui.add_space(8.0);
-            ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                containers(ui, p, unit, cfg, cx, requests);
-                base_image_line(ui, p, unit, cx.status);
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            // The service's ⋯ sits at the end of its first line, in the same
+            // column as each accessory's ⋯, so all menus and links line up.
+            let mut menu_requests = Vec::new();
+            {
+                let mut menu = |ui: &mut Ui| unit_menu(ui, unit, cx, &service, &mut menu_requests);
+                containers(ui, p, unit, cfg, cx, requests, &mut menu);
+            }
+            requests.extend(menu_requests);
+            base_image_line(ui, p, unit, cx.status);
+        });
+    });
+}
+
+/// A line of text with the trailing menu slot on the right.
+fn line_with_menu(ui: &mut Ui, text: RichText, menu: &mut Option<&mut dyn FnMut(&mut Ui)>) {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            trailing_slot(ui, menu.take());
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(text).truncate());
             });
         });
     });
 }
 
-fn containers(ui: &mut Ui, p: &Palette, unit: &Unit, cfg: &UnitConfig, cx: &UnitCtx, requests: &mut Vec<Request>) {
+/// Width every line reserves on the right for a ⋯ menu.
+const MENU_SLOT: f32 = 28.0;
+
+fn trailing_slot(ui: &mut Ui, menu: Option<&mut dyn FnMut(&mut Ui)>) {
+    match menu {
+        Some(menu) => menu(ui),
+        None => {
+            ui.add_space(MENU_SLOT);
+        }
+    }
+}
+
+fn containers(
+    ui: &mut Ui,
+    p: &Palette,
+    unit: &Unit,
+    cfg: &UnitConfig,
+    cx: &UnitCtx,
+    requests: &mut Vec<Request>,
+    unit_menu: &mut dyn FnMut(&mut Ui),
+) {
+    // Handed to the first line drawn; every other line gets an empty slot.
+    let mut unit_menu: Option<&mut dyn FnMut(&mut Ui)> = Some(unit_menu);
     let Some(status) = cx.status else {
         let hosts: Vec<String> = cfg.servers.iter().map(|s| format!("{} on {}", s.role, s.host)).collect();
-        ui.label(theme::caption(format!("Checking {}…", hosts.join(", "))));
+        line_with_menu(ui, theme::caption(format!("Checking {}…", hosts.join(", "))), &mut unit_menu);
         return;
     };
     let unit_hosts: BTreeSet<&str> = cfg.servers.iter().map(|s| s.host.as_str()).collect();
@@ -572,19 +616,16 @@ fn containers(ui: &mut Ui, p: &Palette, unit: &Unit, cfg: &UnitConfig, cx: &Unit
         })
         .collect();
 
-    if running.is_empty() && accessories.iter().all(|(_, _, c)| c.is_none()) {
+    if running.is_empty() {
         let text = if all_unreachable {
             let hosts: Vec<&str> = unit_hosts.iter().copied().collect();
             format!("Status unknown  ·  can't reach {}", hosts.join(", "))
         } else {
             "Not running".to_string()
         };
-        ui.label(RichText::new(text).color(p.muted));
-        if !accessories.is_empty() {
-            let names: Vec<&str> = accessories.iter().map(|(n, _, _)| *n).collect();
-            ui.label(theme::caption(format!("Accessories: {}", names.join(", "))));
-        }
-        return;
+        line_with_menu(ui, RichText::new(text).color(p.muted), &mut unit_menu);
+        ui.add_space(6.0);
+        // Fall through: accessories still get their rows (and Boot).
     }
 
     let logs = |requests: &mut Vec<Request>, host: &str, c: &Container| {
@@ -597,58 +638,221 @@ fn containers(ui: &mut Ui, p: &Palette, unit: &Unit, cfg: &UnitConfig, cx: &Unit
         }));
     };
 
-    egui::Grid::new((&unit.id, "containers")).num_columns(6).spacing([14.0, 6.0]).show(ui, |ui| {
-        for (host, c) in &running {
-            theme::dot(ui, p.ok);
-            ui.label(RichText::new(c.role.as_deref().unwrap_or("app"))).on_hover_text(&c.name);
-            ui.label(RichText::new(*host).monospace().color(p.muted));
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(theme::short_version(&c.version)).monospace()).on_hover_text(&c.version);
-                if let Some(info) = status.versions.get(&c.version) {
-                    match info.behind {
-                        Some(0) => {
-                            ui.label(RichText::new("latest").size(12.5).color(p.ok));
-                        }
-                        Some(n) => {
-                            ui.label(RichText::new(format!("{n} behind")).size(12.5).color(p.warn));
-                        }
-                        None => {}
+    for (host, c) in &running {
+        let info = status.versions.get(&c.version);
+        let freshness = match info.and_then(|i| i.behind) {
+            Some(0) => Some(("latest".to_string(), p.ok)),
+            Some(n) => Some((format!("{n} behind"), p.warn)),
+            None => None,
+        };
+        let open = container_block(
+            ui,
+            p,
+            ContainerLine {
+                dot: p.ok,
+                name: c.role.as_deref().unwrap_or("app"),
+                hover: &c.name,
+                version: Some(&c.version),
+                note: info.and_then(|i| i.subject.as_deref()).unwrap_or(""),
+                freshness,
+                detail: format!("{host}  ·  {}", c.status),
+                logs: true,
+                accessory: None,
+            },
+            unit_menu.take(),
+        );
+        if open.logs {
+            logs(requests, host, c);
+        }
+    }
+    for (name, host, c) in &accessories {
+        let (exists, running) = match c {
+            Some(c) => (true, c.state == "running"),
+            None => (false, false),
+        };
+        let menu =
+            Some(AccessoryMenu { exists: exists || all_unreachable, running, busy: cx.busy, unknown: all_unreachable });
+        let line = match c {
+            Some(c) => ContainerLine {
+                dot: if running { p.ok } else { p.bad },
+                name,
+                hover: &c.name,
+                version: None,
+                note: "accessory",
+                freshness: None,
+                detail: format!("{host}  ·  {}", c.status),
+                logs: true,
+                accessory: menu,
+            },
+            None => ContainerLine {
+                dot: p.border,
+                name,
+                hover: "",
+                version: None,
+                note: "accessory",
+                freshness: None,
+                detail: if all_unreachable { "status unknown" } else { "not running" }.to_string(),
+                logs: false,
+                accessory: menu,
+            },
+        };
+        let click = container_block(ui, p, line, None);
+        if click.logs
+            && let Some(c) = c
+        {
+            logs(requests, host, c);
+        }
+        if let Some(verb) = click.accessory {
+            requests.push(accessory_request(unit, cx, name, verb));
+        }
+    }
+}
+
+/// What a container line's accessory menu may offer.
+struct AccessoryMenu {
+    exists: bool,
+    running: bool,
+    busy: bool,
+    /// Servers unreachable: offer everything, kamal will tell.
+    unknown: bool,
+}
+
+#[derive(Default)]
+struct BlockClick {
+    logs: bool,
+    accessory: Option<AccessoryVerb>,
+}
+
+fn accessory_request(unit: &Unit, cx: &UnitCtx, name: &str, verb: AccessoryVerb) -> Request {
+    let args = unit.kamal_args().join(" ");
+    let intent = Intent::Run {
+        project: cx.project.to_string(),
+        units: vec![unit.id.clone()],
+        action: Action::Accessory { name: name.to_string(), verb },
+        git_ref: None,
+        label: format!("{name} {}", verb.as_str()),
+    };
+    let (title, body, button, danger) = match verb {
+        AccessoryVerb::Details => return Request::Do(intent),
+        AccessoryVerb::Boot => (
+            format!("Boot {name}?"),
+            "Creates and starts the container from the deploy config, with its secrets.",
+            "Boot",
+            false,
+        ),
+        AccessoryVerb::Reboot => (
+            format!("Reboot {name}?"),
+            "Removes and recreates the container with the current config. Data in its volumes is kept, but it is briefly unavailable.",
+            "Reboot",
+            true,
+        ),
+        AccessoryVerb::Restart => {
+            (format!("Restart {name}?"), "Restarts the existing container; briefly unavailable.", "Restart", false)
+        }
+        AccessoryVerb::Start => (format!("Start {name}?"), "Starts the stopped container.", "Start", false),
+        AccessoryVerb::Stop => (format!("Stop {name}?"), "The app may fail while it's stopped.", "Stop", true),
+        AccessoryVerb::Remove => (
+            format!("Remove {name}?"),
+            "Deletes the container, its image AND its data directory on the server. This can't be undone.",
+            "Remove",
+            true,
+        ),
+    };
+    let cmd = Action::Accessory { name: name.to_string(), verb }.kamal_args().join(" ");
+    Request::Confirm(Confirm {
+        title,
+        body: Some(body.into()),
+        details: vec![format!("kamal {cmd} {args}")],
+        button: button.into(),
+        danger,
+        intent,
+    })
+}
+
+struct ContainerLine<'a> {
+    dot: egui::Color32,
+    /// Role (web, scheduler…) or accessory name.
+    name: &'a str,
+    hover: &'a str,
+    version: Option<&'a str>,
+    /// Commit subject, or "accessory".
+    note: &'a str,
+    freshness: Option<(String, egui::Color32)>,
+    /// Host and uptime, shown underneath in grey.
+    detail: String,
+    logs: bool,
+    /// Accessories get their own actions menu.
+    accessory: Option<AccessoryMenu>,
+}
+
+/// One container as two lines: what runs (with actions on the right), then
+/// where and for how long.
+fn container_block(
+    ui: &mut Ui,
+    p: &Palette,
+    line: ContainerLine,
+    unit_menu: Option<&mut dyn FnMut(&mut Ui)>,
+) -> BlockClick {
+    let mut click = BlockClick::default();
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.horizontal(|ui| {
+        // Right side first so the commit subject can truncate to what's left.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if line.accessory.is_none() {
+                trailing_slot(ui, unit_menu);
+            }
+            if let Some(menu) = &line.accessory {
+                theme::more_menu(ui, &format!("Actions for {}", line.name), |ui| {
+                    if menu.busy {
+                        ui.label(theme::caption("A run is in progress. Actions are available when it finishes."));
+                        ui.separator();
                     }
-                    if let Some(s) = &info.subject {
-                        ui.label(theme::caption(truncate(s, 48)));
-                    }
+                    ui.add_enabled_ui(!menu.busy, |ui| {
+                        let mut item = |ui: &mut Ui, text: &str, verb: AccessoryVerb, show: bool| {
+                            if show && ui.button(text).clicked() {
+                                click.accessory = Some(verb);
+                                ui.close();
+                            }
+                        };
+                        item(ui, "Boot", AccessoryVerb::Boot, !menu.exists || menu.unknown);
+                        item(ui, "Start", AccessoryVerb::Start, menu.exists && (!menu.running || menu.unknown));
+                        item(ui, "Restart", AccessoryVerb::Restart, menu.exists && (menu.running || menu.unknown));
+                        item(ui, "Reboot (recreate container)", AccessoryVerb::Reboot, menu.exists);
+                        item(ui, "Stop", AccessoryVerb::Stop, menu.exists && (menu.running || menu.unknown));
+                        ui.separator();
+                        item(ui, "Details", AccessoryVerb::Details, true);
+                        if menu.exists && ui.add(theme::danger(ui, "Remove…")).clicked() {
+                            click.accessory = Some(AccessoryVerb::Remove);
+                            ui.close();
+                        }
+                    });
+                });
+            }
+            if line.logs && theme::link(ui, "Logs").clicked() {
+                click.logs = true;
+            }
+            if let Some((text, color)) = &line.freshness {
+                ui.label(RichText::new(text).size(12.5).color(*color));
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                theme::dot(ui, line.dot);
+                let name = ui.label(RichText::new(line.name).family(theme::medium()));
+                if !line.hover.is_empty() {
+                    name.on_hover_text(line.hover);
                 }
+                if let Some(v) = line.version {
+                    ui.label(RichText::new(theme::short_version(v)).monospace()).on_hover_text(v);
+                }
+                ui.add(egui::Label::new(theme::caption(line.note)).truncate());
             });
-            ui.label(theme::caption(&c.status));
-            if theme::link(ui, "Logs").clicked() {
-                logs(requests, host, c);
-            }
-            ui.end_row();
-        }
-        for (name, host, c) in &accessories {
-            match c {
-                Some(c) => {
-                    theme::dot(ui, if c.state == "running" { p.ok } else { p.bad });
-                    ui.label(*name).on_hover_text(&c.name);
-                    ui.label(RichText::new(*host).monospace().color(p.muted));
-                    ui.label(theme::caption("accessory"));
-                    ui.label(theme::caption(&c.status));
-                    if theme::link(ui, "Logs").clicked() {
-                        logs(requests, host, c);
-                    }
-                }
-                None => {
-                    theme::dot(ui, p.border);
-                    ui.label(*name);
-                    ui.label("");
-                    ui.label(theme::caption("accessory"));
-                    ui.label(theme::caption(if all_unreachable { "status unknown" } else { "not running" }));
-                    ui.label("");
-                }
-            }
-            ui.end_row();
-        }
+        });
     });
+    ui.horizontal(|ui| {
+        ui.add_space(18.0);
+        ui.label(RichText::new(line.detail).size(12.0).color(p.muted));
+    });
+    ui.add_space(10.0);
+    click
 }
 
 fn unit_menu(ui: &mut Ui, unit: &Unit, cx: &UnitCtx, service: &str, requests: &mut Vec<Request>) {
@@ -849,31 +1053,32 @@ fn base_image_line(ui: &mut Ui, p: &Palette, unit: &Unit, status: Option<&Projec
             }
         }
     }
-    ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(theme::caption("Base image"));
-        ui.label(RichText::new(base).monospace().size(12.0));
-        if images::is_pinned(base) {
-            ui.label(theme::caption("· pinned"));
+        let kind = if images::is_pinned(base) {
+            "Pinned to this version."
         } else {
-            ui.label(theme::caption("· floating tag"))
-                .on_hover_text("Each deploy builds on whatever was last published under this tag.");
-        }
+            "Floating tag: each deploy builds on whatever was last published under it."
+        };
+        ui.label(theme::caption("Image")).on_hover_text(kind);
+        ui.label(RichText::new(base).monospace().size(12.0).color(p.muted)).on_hover_text(kind);
         for (version, source) in &running {
-            ui.label(theme::caption(format!("· running {version}")));
             let latest = source.as_ref().and_then(|s| status.and_then(|st| st.releases.get(s)));
             match latest {
                 Some(r) if r.tag == *version => {
+                    ui.label(theme::caption(format!("· {version}")));
                     ui.label(RichText::new("latest").size(12.5).color(p.ok));
                 }
                 Some(r) => {
                     let date = r.published_at.get(..10).unwrap_or(&r.published_at);
+                    ui.label(theme::caption(format!("· {version} →")));
                     ui.label(RichText::new(format!("{} available", r.tag)).size(12.5).color(p.warn))
                         .on_hover_text(format!("Released {date}. Deploy to pick it up."));
                     ui.hyperlink_to(RichText::new("Release notes").size(12.5).color(theme::ACCENT), &r.url);
                 }
-                None => {}
+                None => {
+                    ui.label(theme::caption(format!("· {version}")));
+                }
             }
         }
     });

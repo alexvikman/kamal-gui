@@ -35,6 +35,10 @@ fn git_in(dir: &Path) -> Command {
 
 /// Create the bare clone if needed, then fetch. Returns the mirror path.
 pub fn ensure_mirror(project: &str, origin: &str) -> Result<PathBuf> {
+    crate::env::with_ssh(|| ensure_mirror_inner(project, origin))
+}
+
+fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
     let dir = mirror_dir(project);
     if !dir.join("HEAD").exists() {
         std::fs::create_dir_all(dir.parent().unwrap())?;

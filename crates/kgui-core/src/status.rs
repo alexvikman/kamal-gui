@@ -85,6 +85,10 @@ pub fn host_status(host: &str, ssh: &SshTarget) -> HostStatus {
 }
 
 fn containers(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
+    crate::env::with_ssh(|| containers_inner(host, ssh))
+}
+
+fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // One round trip: the container list, then each container's full label map
     // (`docker ps` flattens labels into a comma-separated string, which breaks
     // on values that contain commas).

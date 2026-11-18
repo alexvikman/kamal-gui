@@ -64,12 +64,50 @@ fn version_key(dir: &Path) -> Vec<u64> {
 pub enum Action {
     Deploy,
     Redeploy,
-    Rollback { version: String },
+    Rollback {
+        version: String,
+    },
     AppBoot,
     AppDetails,
     LockStatus,
     LockRelease,
-    Custom { args: Vec<String> },
+    /// `kamal accessory <verb> <name>`, e.g. boot redis.
+    Accessory {
+        name: String,
+        verb: AccessoryVerb,
+    },
+    Custom {
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessoryVerb {
+    /// Create and start the container from the config.
+    Boot,
+    /// Remove and recreate the container (picks up config changes).
+    Reboot,
+    Start,
+    Stop,
+    Restart,
+    Details,
+    /// Remove the container, image and data directory.
+    Remove,
+}
+
+impl AccessoryVerb {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessoryVerb::Boot => "boot",
+            AccessoryVerb::Reboot => "reboot",
+            AccessoryVerb::Start => "start",
+            AccessoryVerb::Stop => "stop",
+            AccessoryVerb::Restart => "restart",
+            AccessoryVerb::Details => "details",
+            AccessoryVerb::Remove => "remove",
+        }
+    }
 }
 
 impl Action {
@@ -82,6 +120,14 @@ impl Action {
             Action::AppDetails => vec!["app", "details"],
             Action::LockStatus => vec!["lock", "status"],
             Action::LockRelease => vec!["lock", "release"],
+            Action::Accessory { name, verb } => {
+                let mut args = vec!["accessory".to_string(), verb.as_str().to_string(), name.clone()];
+                // The app has already asked; kamal would otherwise prompt on stdin.
+                if *verb == AccessoryVerb::Remove {
+                    args.push("-y".into());
+                }
+                return args;
+            }
             Action::Custom { args } => return args.clone(),
         };
         v.into_iter().map(String::from).collect()
@@ -103,13 +149,28 @@ impl Action {
     /// Prefetch secrets for commands that boot containers. Read-only commands
     /// skip it; Kamal loads secrets lazily, and `kgui secret` falls back to op.
     pub fn needs_secrets(&self) -> bool {
-        !matches!(self, Action::AppDetails | Action::LockStatus | Action::LockRelease)
+        match self {
+            Action::AppDetails | Action::LockStatus | Action::LockRelease => false,
+            // Booting an accessory passes its env (e.g. REDIS_PASSWORD).
+            Action::Accessory { verb, .. } => matches!(verb, AccessoryVerb::Boot | AccessoryVerb::Reboot),
+            _ => true,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accessory_commands() {
+        let a = |verb| Action::Accessory { name: "redis".into(), verb };
+        assert_eq!(a(AccessoryVerb::Boot).kamal_args(), ["accessory", "boot", "redis"]);
+        assert_eq!(a(AccessoryVerb::Remove).kamal_args(), ["accessory", "remove", "redis", "-y"]);
+        assert!(a(AccessoryVerb::Reboot).needs_secrets());
+        assert!(!a(AccessoryVerb::Restart).needs_secrets());
+        assert!(!a(AccessoryVerb::Boot).uses_ref());
+    }
 
     #[test]
     fn ruby_versions_sort_numerically() {

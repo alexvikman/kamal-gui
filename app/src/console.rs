@@ -277,7 +277,7 @@ impl Console {
             if !self.has_tabs(scope) || self.collapsed {
                 return;
             }
-            egui::Frame::new().inner_margin(Margin { left: 12, right: 8, top: 6, bottom: 4 }).show(ui, |ui| {
+            egui::Frame::new().inner_margin(Margin { left: 14, right: 10, top: 8, bottom: 16 }).show(ui, |ui| {
                 self.output(ui, scope);
             });
         });

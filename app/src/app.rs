@@ -152,9 +152,8 @@ impl KamalApp {
     fn sidebar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let p = theme::palette(ui);
-        ui.add_space(8.0);
-        ui.label(theme::title("Kamal GUI", 15.0));
-        ui.add_space(4.0);
+        // The window title already says "Kamal GUI"; start with search.
+        ui.add_space(10.0);
         ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search projects…").desired_width(f32::INFINITY));
         ui.add_space(2.0);
         let all = ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {

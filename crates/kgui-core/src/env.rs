@@ -91,6 +91,30 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     c
 }
 
+static SSH_APPROVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SSH_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run something that uses the SSH agent (git over ssh, ssh to servers).
+///
+/// Agents like 1Password ask for approval per application. If the first
+/// connections start at the same moment, each one triggers its own prompt.
+/// So the first SSH use runs alone; once it's done (and approved), the rest
+/// run in parallel and reuse the approval.
+pub fn with_ssh<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering;
+    if SSH_APPROVED.load(Ordering::Acquire) {
+        return f();
+    }
+    let guard = SSH_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if SSH_APPROVED.load(Ordering::Acquire) {
+        drop(guard);
+        return f();
+    }
+    let result = f();
+    SSH_APPROVED.store(true, Ordering::Release);
+    result
+}
+
 /// Run to completion and return trimmed stdout, or an error carrying stderr.
 pub fn run(cmd: &mut Command) -> Result<String> {
     let desc = describe(cmd);
@@ -109,4 +133,38 @@ fn describe(cmd: &Command) -> String {
         s.push_str(&a.to_string_lossy());
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// The first SSH use runs alone; nothing overlaps it.
+    #[test]
+    fn first_ssh_use_runs_alone() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_during_first = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let (active, max) = (active.clone(), max_during_first.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(i * 5));
+                    with_ssh(|| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        if !SSH_APPROVED.load(Ordering::SeqCst) {
+                            max.fetch_max(now, Ordering::SeqCst);
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+            })
+            .collect();
+        handles.into_iter().for_each(|h| h.join().unwrap());
+        assert_eq!(max_during_first.load(Ordering::SeqCst), 1);
+        assert!(SSH_APPROVED.load(Ordering::SeqCst));
+    }
 }
