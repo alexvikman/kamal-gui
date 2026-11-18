@@ -31,7 +31,8 @@ pub struct Repo {
 
 /// Owners the signed-in user can browse: the user and their organizations.
 pub fn owners() -> Result<Vec<String>> {
-    let user = run(command("gh").args(["api", "user", "--jq", ".login"])).context("gh is not signed in (run `gh auth login`)")?;
+    let user = run(command("gh").args(["api", "user", "--jq", ".login"]))
+        .context("gh is not signed in (run `gh auth login`)")?;
     let orgs = run(command("gh").args(["api", "user/orgs", "--jq", ".[].login"])).unwrap_or_default();
     let mut out: Vec<String> = orgs.lines().map(String::from).collect();
     out.sort();
@@ -79,13 +80,18 @@ fn kamal_repos(owner: &str) -> Result<HashSet<String>> {
         name_with_owner: String,
     }
     let out = run(command("gh").args([
-        "search", "code", "service", "--owner", owner, "--filename", "deploy.yml", "--json", "path,repository",
-        "--limit", "1000",
+        "search",
+        "code",
+        "service",
+        "--owner",
+        owner,
+        "--filename",
+        "deploy.yml",
+        "--json",
+        "path,repository",
+        "--limit",
+        "1000",
     ]))?;
     let hits: Vec<Hit> = serde_json::from_str(&out)?;
-    Ok(hits
-        .into_iter()
-        .filter(|h| h.path.starts_with("config/deploy"))
-        .map(|h| h.repository.name_with_owner)
-        .collect())
+    Ok(hits.into_iter().filter(|h| h.path.starts_with("config/deploy")).map(|h| h.repository.name_with_owner).collect())
 }

@@ -74,7 +74,16 @@ impl HistoryView {
             table = table.resizable(false);
             table
                 .header(26.0, |mut h| {
-                    for title in ["Started", if show_project { "Project" } else { "" }, "Command", "Units", "Commit", "Status", "Duration", ""] {
+                    for title in [
+                        "Started",
+                        if show_project { "Project" } else { "" },
+                        "Command",
+                        "Units",
+                        "Commit",
+                        "Status",
+                        "Duration",
+                        "",
+                    ] {
                         h.col(|ui| {
                             ui.label(RichText::new(title).family(theme::medium()).color(p.muted));
                         });
@@ -108,8 +117,7 @@ impl HistoryView {
                                 if let Some(sha) = &r.sha {
                                     ui.label(RichText::new(&sha[..sha.len().min(7)]).monospace());
                                     ui.add(
-                                        egui::Label::new(theme::caption(r.subject.as_deref().unwrap_or("")))
-                                            .truncate(),
+                                        egui::Label::new(theme::caption(r.subject.as_deref().unwrap_or(""))).truncate(),
                                     );
                                 }
                             });

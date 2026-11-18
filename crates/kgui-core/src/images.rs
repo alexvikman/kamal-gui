@@ -107,11 +107,7 @@ pub fn latest_release(source: &str) -> Option<Release> {
     {
         return r.clone();
     }
-    let repo = source
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .strip_prefix("https://github.com/")?
-        .to_string();
+    let repo = source.trim_end_matches('/').trim_end_matches(".git").strip_prefix("https://github.com/")?.to_string();
     let result = run(command("gh").args([
         "api",
         &format!("repos/{repo}/releases/latest"),

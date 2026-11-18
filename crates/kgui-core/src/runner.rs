@@ -193,7 +193,7 @@ impl Runner {
             "invalid container name: {container}"
         );
         let key = format!("log:{}", self.inner.next_log.fetch_add(1, Ordering::Relaxed) + 1);
-        let mut cmd = status::ssh_command(host, ssh);
+        let mut cmd = status::ssh_command(host, ssh)?;
         cmd.arg(format!("docker logs --follow --timestamps --tail {tail} {container}"));
         let cancel = self.register(&key);
         let runner = self.clone();
@@ -335,7 +335,9 @@ fn execute(
     if action.needs_secrets() {
         let mut problems: Vec<String> = units
             .iter()
-            .filter_map(|u| secrets::missing_files_problem(&wt, u.config.secrets_path.as_deref(), u.destination.as_deref()))
+            .filter_map(|u| {
+                secrets::missing_files_problem(&wt, u.config.secrets_path.as_deref(), u.destination.as_deref())
+            })
             .collect();
         problems.dedup();
         if !problems.is_empty() {

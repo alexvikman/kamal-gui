@@ -1,4 +1,6 @@
-use egui::{Color32, CornerRadius, FontFamily, Margin, RichText, Stroke, TextStyle, ThemePreference, Ui, Visuals, vec2};
+use egui::{
+    Color32, CornerRadius, FontFamily, Margin, RichText, Stroke, TextStyle, ThemePreference, Ui, Visuals, vec2,
+};
 
 pub const ACCENT: Color32 = Color32::from_rgb(0x25, 0x63, 0xeb);
 pub const TEXT: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
@@ -33,9 +35,10 @@ fn install_fonts(ctx: &egui::Context) {
     fonts
         .font_data
         .insert("geist".into(), Arc::new(FontData::from_static(include_bytes!("../assets/fonts/Geist-Regular.ttf"))));
-    fonts
-        .font_data
-        .insert("geist-medium".into(), Arc::new(FontData::from_static(include_bytes!("../assets/fonts/Geist-Medium.ttf"))));
+    fonts.font_data.insert(
+        "geist-medium".into(),
+        Arc::new(FontData::from_static(include_bytes!("../assets/fonts/Geist-Medium.ttf"))),
+    );
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "geist".into());
     // Medium falls back to the regular stack for glyphs Geist lacks.
     let mut medium_stack = vec!["geist-medium".to_string()];
@@ -160,7 +163,10 @@ pub fn dot(ui: &mut Ui, color: Color32) {
 /// anything (git and ssh errors are long and mostly noise).
 pub fn summarize_error(msg: &str) -> (String, Option<String>) {
     let known = [
-        ("Permission denied (publickey)", "GitHub refused the SSH key. Is your SSH agent (1Password) unlocked and allowed to sign for this app?"),
+        (
+            "Permission denied (publickey)",
+            "GitHub refused the SSH key. Is your SSH agent (1Password) unlocked and allowed to sign for this app?",
+        ),
         ("communication with agent failed", "Couldn't talk to the SSH agent (1Password). Unlock it and try again."),
         ("Could not resolve host", "Can't reach the server. Check your internet connection."),
         ("Operation timed out", "The connection timed out. Is the VPN up?"),
@@ -198,7 +204,9 @@ pub fn dismissable(ui: &mut Ui, fg: Color32, bg: Color32, msg: &str) -> bool {
                         egui::CollapsingHeader::new(RichText::new("Details").size(12.5).color(fg))
                             .id_salt(("error-details", msg.len(), msg.chars().take(40).collect::<String>()))
                             .show(ui, |ui| {
-                                ui.add(egui::Label::new(RichText::new(details).monospace().size(11.5).color(fg)).wrap());
+                                ui.add(
+                                    egui::Label::new(RichText::new(details).monospace().size(11.5).color(fg)).wrap(),
+                                );
                             });
                     }
                 });
@@ -209,15 +217,14 @@ pub fn dismissable(ui: &mut Ui, fg: Color32, bg: Color32, msg: &str) -> bool {
 }
 
 pub fn banner(ui: &mut Ui, fg: Color32, bg: Color32, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
+    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(10, 8)).show(
+        ui,
+        |ui| {
             ui.set_width(ui.available_width());
             ui.visuals_mut().override_text_color = Some(fg);
             add(ui);
-        });
+        },
+    );
 }
 
 /// Small muted secondary text.
@@ -248,7 +255,9 @@ pub fn quiet_rich(ui: &mut Ui, text: RichText) -> egui::Response {
 
 /// White button with a hairline border.
 pub fn secondary(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string())).fill(Color32::WHITE).stroke(Stroke::new(1.0, palette_static().border))
+    egui::Button::new(RichText::new(text.to_string()))
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, palette_static().border))
 }
 
 /// A "⋯" button that opens `menu` below it.
@@ -275,11 +284,15 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str
         ui.spacing_mut().item_spacing.x = 20.0;
         for (value, label) in items {
             let active = *current == *value;
-            let text = if active { RichText::new(*label).family(medium()) } else { RichText::new(*label).color(p.muted) };
+            let text =
+                if active { RichText::new(*label).family(medium()) } else { RichText::new(*label).color(p.muted) };
             let r = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
             if active {
                 let y = r.rect.bottom() + 6.0;
-                ui.painter().line_segment([egui::pos2(r.rect.left(), y), egui::pos2(r.rect.right(), y)], Stroke::new(2.0, TEXT));
+                ui.painter().line_segment(
+                    [egui::pos2(r.rect.left(), y), egui::pos2(r.rect.right(), y)],
+                    Stroke::new(2.0, TEXT),
+                );
             }
             if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 *current = *value;

@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; the release job asks for more on its own.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (app, core, CLI)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  linux-core:
+    name: Linux (core, CLI)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy
+        run: cargo clippy -p kgui-core -p kgui-cli --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test -p kgui-core -p kgui-cli --locked
+
+  nightly:
+    name: Nightly release
+    # Only for pushes to main, and only once every check has passed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [macos, linux-core]
+    runs-on: macos-15
+    permissions:
+      contents: write # publish the release
+      id-token: write # sign build provenance
+      attestations: write
+    concurrency:
+      group: nightly
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: nightly
+
+      - name: Build universal binaries (Apple Silicon + Intel)
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$target" -p kamal-gui -p kgui-cli
+          done
+          mkdir -p dist
+          for bin in kamal-gui kgui; do
+            lipo -create -output "dist/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin"
+          done
+          lipo -info dist/kamal-gui dist/kgui
+
+      - name: Bundle and package
+        env:
+          KGUI_BIN: dist/kamal-gui
+          KGUI_VERSION: 0.1.0-nightly.${{ github.run_number }}
+        run: |
+          ./scripts/bundle-macos.sh
+          ditto -c -k --keepParent "target/release/bundle/Kamal GUI.app" dist/KamalGUI-nightly-macos-universal.zip
+          tar -C dist -czf dist/kgui-nightly-macos-universal.tar.gz kgui
+          (cd dist && shasum -a 256 KamalGUI-nightly-macos-universal.zip kgui-nightly-macos-universal.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/KamalGUI-nightly-macos-universal.zip
+            dist/kgui-nightly-macos-universal.tar.gz
+
+      - name: Publish rolling "nightly" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          short="${SHA::7}"
+          cat > notes.md <<NOTES
+          Automatic build of \`main\` at ${short} (run ${RUN_NUMBER}). Replaced on every push.
+
+          **Kamal GUI.app** (universal: Apple Silicon + Intel): unzip and move to /Applications.
+          The app is not notarized, so remove the quarantine flag once:
+
+          \`\`\`
+          xattr -dr com.apple.quarantine "/Applications/Kamal GUI.app"
+          \`\`\`
+
+          **kgui CLI**: \`tar -xzf kgui-nightly-macos-universal.tar.gz && mv kgui ~/.local/bin/\`
+
+          Verify a download: \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\` and \`shasum -a 256 -c SHA256SUMS\`.
+          NOTES
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly \
+            dist/KamalGUI-nightly-macos-universal.zip \
+            dist/kgui-nightly-macos-universal.tar.gz \
+            dist/SHA256SUMS \
+            --target "$SHA" \
+            --prerelease \
+            --title "Nightly $(date -u +%Y-%m-%d) (${short})" \
+            --notes-file notes.md

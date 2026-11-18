@@ -82,11 +82,7 @@ pub fn confirm(ctx: &egui::Context, c: &Confirm) -> Option<bool> {
             });
         }
         buttons(ui, |ui| {
-            let ok = if c.danger {
-                theme::filled(&c.button, p.bad)
-            } else {
-                theme::primary(&c.button)
-            };
+            let ok = if c.danger { theme::filled(&c.button, p.bad) } else { theme::primary(&c.button) };
             if ui.add(ok).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                 answer = Some(true);
             }
@@ -110,12 +106,17 @@ pub fn prompt(ctx: &egui::Context, p: &mut Prompt) -> Option<Option<String>> {
         ui.label(theme::title(&p.title, 15.0));
         ui.add(egui::Label::new(RichText::new(&p.body).color(pal.muted)).wrap());
         let r = ui.add(
-            egui::TextEdit::singleline(&mut p.value).hint_text(&p.hint).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY),
+            egui::TextEdit::singleline(&mut p.value)
+                .hint_text(&p.hint)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY),
         );
         r.request_focus();
         let submit = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         buttons(ui, |ui| {
-            if (ui.add_enabled(!p.value.trim().is_empty(), theme::primary("Run")).clicked() || submit) && !p.value.trim().is_empty() {
+            if (ui.add_enabled(!p.value.trim().is_empty(), theme::primary("Run")).clicked() || submit)
+                && !p.value.trim().is_empty()
+            {
                 answer = Some(Some(p.value.clone()));
             }
             if ui.button("Cancel").clicked() {
@@ -171,7 +172,12 @@ impl SettingsDialog {
     pub fn new() -> Self {
         let settings = Settings::load();
         let detected = kamal::binary(&Settings { kamal_path: None, ..settings.clone() }).display().to_string();
-        Self { kamal_path: settings.kamal_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(), settings, detected, error: None }
+        Self {
+            kamal_path: settings.kamal_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            settings,
+            detected,
+            error: None,
+        }
     }
 
     /// Returns true when the dialog should close.
@@ -183,7 +189,11 @@ impl SettingsDialog {
             ui.label(theme::title("Settings", 15.0));
             ui.add_space(4.0);
             ui.label(RichText::new("1Password account").family(theme::medium()));
-            ui.add(egui::TextEdit::singleline(&mut self.settings.op_account).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.op_account)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
             ui.label(RichText::new("Used for op:// references in .kamal/secrets.").size(12.0).color(p.muted));
             ui.add_space(6.0);
             ui.label(RichText::new("Path to kamal").family(theme::medium()));
@@ -264,7 +274,8 @@ impl AddDialog {
     fn poll(&mut self, ctx: &egui::Context) -> Option<Vec<String>> {
         match task::poll(&mut self.owners_task) {
             Some(Ok((owners, preferred))) => {
-                self.owner = if owners.contains(&preferred) { preferred } else { owners.first().cloned().unwrap_or_default() };
+                self.owner =
+                    if owners.contains(&preferred) { preferred } else { owners.first().cloned().unwrap_or_default() };
                 self.owners = owners;
             }
             Some(Err(e)) => {
@@ -352,9 +363,11 @@ impl AddDialog {
                             .desired_width(f32::INFINITY),
                     );
                     ui.label(
-                        RichText::new("The app keeps its own clone and deploys from it. Your working copies are never touched.")
-                            .size(12.0)
-                            .color(p.muted),
+                        RichText::new(
+                            "The app keeps its own clone and deploys from it. Your working copies are never touched.",
+                        )
+                        .size(12.0)
+                        .color(p.muted),
                     );
                 }
                 Mode::Github => self.github_list(ui, existing, busy),
@@ -363,7 +376,11 @@ impl AddDialog {
             if busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("Cloning {} repositor{}…", self.adding_count, if self.adding_count == 1 { "y" } else { "ies" }));
+                    ui.label(format!(
+                        "Cloning {} repositor{}…",
+                        self.adding_count,
+                        if self.adding_count == 1 { "y" } else { "ies" }
+                    ));
                 });
             }
             if let Some(e) = &self.error {
@@ -372,10 +389,20 @@ impl AddDialog {
 
             buttons(ui, |ui| {
                 let (label, urls): (String, Vec<String>) = match self.mode {
-                    Mode::Url => ("Add project".into(), if self.url.trim().is_empty() { vec![] } else { vec![self.url.trim().to_string()] }),
+                    Mode::Url => (
+                        "Add project".into(),
+                        if self.url.trim().is_empty() { vec![] } else { vec![self.url.trim().to_string()] },
+                    ),
                     Mode::Github => {
                         let n = self.picked.len();
-                        (format!("Add {} project{}", if n > 0 { n.to_string() } else { String::new() }, if n == 1 { "" } else { "s" }), self.picked.iter().cloned().collect())
+                        (
+                            format!(
+                                "Add {} project{}",
+                                if n > 0 { n.to_string() } else { String::new() },
+                                if n == 1 { "" } else { "s" }
+                            ),
+                            self.picked.iter().cloned().collect(),
+                        )
                     }
                 };
                 if ui.add_enabled(!busy && !urls.is_empty(), theme::primary(label.trim())).clicked() {
@@ -410,40 +437,49 @@ impl AddDialog {
             .filter(|r| r.full_name.to_lowercase().contains(&q))
             .collect();
         egui::Frame::new().stroke(egui::Stroke::new(1.0, p.border)).corner_radius(6).inner_margin(6).show(ui, |ui| {
-            ScrollArea::vertical().min_scrolled_height(320.0).max_height(420.0).auto_shrink([false, false]).show(ui, |ui| {
-                if self.owners_task.is_some() || self.repos_task.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Loading repositories…").color(p.muted));
-                    });
-                    return;
-                }
-                if visible.is_empty() {
-                    ui.label(RichText::new("No repositories match.").color(p.muted));
-                }
-                for r in visible {
-                    let done = existing.iter().any(|e| e.url == r.url || e.name == r.name);
-                    ui.horizontal(|ui| {
-                        let mut checked = done || self.picked.contains(&r.url);
-                        if ui.add_enabled(!done && !busy, egui::Checkbox::new(&mut checked, RichText::new(&r.name).family(theme::medium()))).changed() {
-                            if checked {
-                                self.picked.insert(r.url.clone());
-                            } else {
-                                self.picked.remove(&r.url);
+            ScrollArea::vertical().min_scrolled_height(320.0).max_height(420.0).auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    if self.owners_task.is_some() || self.repos_task.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("Loading repositories…").color(p.muted));
+                        });
+                        return;
+                    }
+                    if visible.is_empty() {
+                        ui.label(RichText::new("No repositories match.").color(p.muted));
+                    }
+                    for r in visible {
+                        let done = existing.iter().any(|e| e.url == r.url || e.name == r.name);
+                        ui.horizontal(|ui| {
+                            let mut checked = done || self.picked.contains(&r.url);
+                            if ui
+                                .add_enabled(
+                                    !done && !busy,
+                                    egui::Checkbox::new(&mut checked, RichText::new(&r.name).family(theme::medium())),
+                                )
+                                .changed()
+                            {
+                                if checked {
+                                    self.picked.insert(r.url.clone());
+                                } else {
+                                    self.picked.remove(&r.url);
+                                }
                             }
-                        }
-                        if r.kamal == Some(true) {
-                            ui.label(RichText::new("Kamal").size(12.5).color(theme::ACCENT));
-                        }
-                        if done {
-                            ui.label(theme::caption("Already added"));
-                        }
-                        if let Some(d) = &r.description {
-                            ui.add(egui::Label::new(RichText::new(d).color(p.muted)).truncate());
-                        }
-                    });
-                }
-            });
+                            if r.kamal == Some(true) {
+                                ui.label(RichText::new("Kamal").size(12.5).color(theme::ACCENT));
+                            }
+                            if done {
+                                ui.label(theme::caption("Already added"));
+                            }
+                            if let Some(d) = &r.description {
+                                ui.add(egui::Label::new(RichText::new(d).color(p.muted)).truncate());
+                            }
+                        });
+                    }
+                },
+            );
         });
     }
 }
@@ -454,7 +490,10 @@ mod tests {
 
     #[test]
     fn splits_quoted_args() {
-        assert_eq!(split_args(r#"app exec "php artisan about" -r web"#), vec!["app", "exec", "php artisan about", "-r", "web"]);
+        assert_eq!(
+            split_args(r#"app exec "php artisan about" -r web"#),
+            vec!["app", "exec", "php artisan about", "-r", "web"]
+        );
         assert_eq!(split_args("lock  status"), vec!["lock", "status"]);
         assert_eq!(split_args("x ''"), vec!["x", ""]);
     }

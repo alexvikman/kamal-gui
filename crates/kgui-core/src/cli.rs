@@ -167,7 +167,9 @@ fn doctor() -> Result<()> {
     let version = |cmd: &mut std::process::Command| run(cmd).map(|v| v.lines().next().unwrap_or("").to_string());
     let kamal_version = version(command(&kamal).arg("version")).unwrap_or_else(|e| format!("error: {e:#}"));
     println!("kamal   {} ({kamal_version})", kamal.display());
-    for (name, args) in [("op", vec!["--version"]), ("gh", vec!["--version"]), ("git", vec!["--version"]), ("ssh", vec!["-V"])] {
+    for (name, args) in
+        [("op", vec!["--version"]), ("gh", vec!["--version"]), ("git", vec!["--version"]), ("ssh", vec!["-V"])]
+    {
         let out = command(name).args(&args).output();
         let line = match out {
             Ok(o) => {

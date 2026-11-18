@@ -93,23 +93,19 @@ impl History {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Run>> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT {COLS} FROM runs WHERE id=?1"), params![id], row)
-            .optional()?)
+        Ok(self.conn.query_row(&format!("SELECT {COLS} FROM runs WHERE id=?1"), params![id], row).optional()?)
     }
 
     pub fn list(&self, project: Option<&str>, limit: u32) -> Result<Vec<Run>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLS} FROM runs WHERE (?1 IS NULL OR project=?1) ORDER BY id DESC LIMIT ?2"
-        ))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {COLS} FROM runs WHERE (?1 IS NULL OR project=?1) ORDER BY id DESC LIMIT ?2"))?;
         let rows = stmt.query_map(params![project, limit], row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 
-const COLS: &str =
-    "id, project, units, action, git_ref, sha, subject, started_at, finished_at, status, exit_code";
+const COLS: &str = "id, project, units, action, git_ref, sha, subject, started_at, finished_at, status, exit_code";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Run> {
     Ok(Run {

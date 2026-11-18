@@ -94,10 +94,7 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// Run to completion and return trimmed stdout, or an error carrying stderr.
 pub fn run(cmd: &mut Command) -> Result<String> {
     let desc = describe(cmd);
-    let out = cmd
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("could not start `{desc}`"))?;
+    let out = cmd.stdin(Stdio::null()).output().with_context(|| format!("could not start `{desc}`"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("`{desc}` failed ({}): {}", out.status, stderr.trim());

@@ -4,6 +4,22 @@ A native macOS app, written entirely in Rust ([egui](https://github.com/emilk/eg
 your [Kamal](https://kamal-deploy.org) projects from one place, without tying
 deploys to the checkout you're working in.
 
+[![CI](https://github.com/alexvikman/kamal-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/alexvikman/kamal-gui/actions/workflows/ci.yml)
+
+## Install
+
+Every push to `main` that passes CI publishes a
+[nightly release](https://github.com/alexvikman/kamal-gui/releases/tag/nightly)
+(universal: Apple Silicon + Intel):
+
+- `KamalGUI-nightly-macos-universal.zip`: unzip, move `Kamal GUI.app` to
+  `/Applications`. It isn't notarized, so clear the quarantine flag once:
+  `xattr -dr com.apple.quarantine "/Applications/Kamal GUI.app"`
+- `kgui-nightly-macos-universal.tar.gz`: the `kgui` CLI
+
+Each artifact has signed build provenance:
+`gh attestation verify <file> -R alexvikman/kamal-gui`.
+
 ## How it works
 
 - **Projects are added to the app**, either by picking repositories from GitHub

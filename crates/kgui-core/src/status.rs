@@ -49,28 +49,38 @@ struct PsLine {
     labels: String,
 }
 
-pub fn ssh_command(host: &str, ssh: &SshTarget) -> std::process::Command {
+/// Hosts, users and jump hosts come from deploy configs in cloned repos, so
+/// treat them as untrusted: a value like `-oProxyCommand=…` would otherwise be
+/// read by ssh as an option and run a local command.
+fn check_ssh_value(value: &str, what: &str, extra: &str) -> Result<()> {
+    let ok = !value.is_empty()
+        && !value.starts_with('-')
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || "._-:[]".contains(c) || extra.contains(c));
+    anyhow::ensure!(ok, "refusing unsafe ssh {what} from deploy config: {value:?}");
+    Ok(())
+}
+
+pub fn ssh_command(host: &str, ssh: &SshTarget) -> Result<std::process::Command> {
+    check_ssh_value(host, "host", "")?;
+    check_ssh_value(&ssh.user, "user", "")?;
+    if let Some(proxy) = &ssh.proxy {
+        // `-J user@jump1,user@jump2:port`
+        check_ssh_value(proxy, "proxy", "@,")?;
+    }
     let mut c = command("ssh");
-    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-p"])
-        .arg(ssh.port.to_string())
-        .arg("-l")
-        .arg(&ssh.user);
+    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-p"]).arg(ssh.port.to_string()).arg("-l").arg(&ssh.user);
     if let Some(proxy) = &ssh.proxy {
         c.arg("-J").arg(proxy);
     }
-    c.arg(host);
-    c
+    // `--` ends option parsing: the host can never be taken as a flag.
+    c.arg("--").arg(host);
+    Ok(c)
 }
 
 pub fn host_status(host: &str, ssh: &SshTarget) -> HostStatus {
     match containers(host, ssh) {
         Ok(containers) => HostStatus { host: host.into(), ok: true, error: None, containers },
-        Err(e) => HostStatus {
-            host: host.into(),
-            ok: false,
-            error: Some(format!("{e:#}")),
-            containers: vec![],
-        },
+        Err(e) => HostStatus { host: host.into(), ok: false, error: Some(format!("{e:#}")), containers: vec![] },
     }
 }
 
@@ -78,7 +88,7 @@ fn containers(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // One round trip: the container list, then each container's full label map
     // (`docker ps` flattens labels into a comma-separated string, which breaks
     // on values that contain commas).
-    let output = ssh_command(host, ssh)
+    let output = ssh_command(host, ssh)?
         .arg(format!(
             "docker ps -a --no-trunc --filter label=service --format '{{{{json .}}}}'; echo {MARK}; \
              docker ps -aq --filter label=service | xargs -r docker inspect --format '{{{{json .Name}}}}{{{{\"\\t\"}}}}{{{{json .Config.Labels}}}}'"
@@ -105,8 +115,7 @@ fn containers(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
         .lines()
         .filter_map(|l| serde_json::from_str::<PsLine>(l).ok())
         .map(|p| {
-            let labels: HashMap<&str, &str> =
-                p.labels.split(',').filter_map(|kv| kv.split_once('=')).collect();
+            let labels: HashMap<&str, &str> = p.labels.split(',').filter_map(|kv| kv.split_once('=')).collect();
             let label = |k: &str| labels.get(k).filter(|v| !v.is_empty()).map(|v| v.to_string());
             let full = full_labels.get(&p.names);
             let full_label = |k: &str| full.and_then(|l| l.get(k)).filter(|v| !v.is_empty()).cloned();
@@ -208,4 +217,31 @@ pub fn project_status(detail: &crate::project::ProjectDetail) -> ProjectStatus {
         handles.into_iter().filter_map(|h| h.join().ok()).filter_map(|(s, r)| Some((s, r?))).collect()
     });
     ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(user: &str, proxy: Option<&str>) -> SshTarget {
+        SshTarget { user: user.into(), port: 22, proxy: proxy.map(String::from) }
+    }
+
+    #[test]
+    fn rejects_option_injection_from_configs() {
+        assert!(ssh_command("10.0.0.1", &target("root", None)).is_ok());
+        assert!(ssh_command("app-1.example.com", &target("deploy", Some("ops@bastion:2222,jump2"))).is_ok());
+        assert!(ssh_command("[fd00::1]", &target("root", None)).is_ok());
+        assert!(ssh_command("-oProxyCommand=touch /tmp/x", &target("root", None)).is_err());
+        assert!(ssh_command("host", &target("-oProxyCommand=x", None)).is_err());
+        assert!(ssh_command("host", &target("root", Some("-oProxyCommand=x"))).is_err());
+        assert!(ssh_command("host name", &target("root", None)).is_err());
+        assert!(ssh_command("host;rm", &target("root", None)).is_err());
+        let args: Vec<String> = ssh_command("10.0.0.1", &target("root", None))
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[args.len() - 2..], ["--", "10.0.0.1"]);
+    }
 }

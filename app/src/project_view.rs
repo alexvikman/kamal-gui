@@ -5,8 +5,8 @@ use crate::theme::{self, Palette};
 use egui::{Align, Layout, RichText, ScrollArea, Ui, vec2};
 use kgui_core::config::UnitConfig;
 use kgui_core::git::{self, RefList};
-use kgui_core::images;
 use kgui_core::history::Run;
+use kgui_core::images;
 use kgui_core::kamal::Action;
 use kgui_core::project::{self, ProjectDetail, Target, Unit};
 use kgui_core::status::{self, Container, ProjectStatus};
@@ -269,7 +269,10 @@ impl ProjectView {
             if !failed.is_empty() {
                 theme::banner(ui, p.warn, p.warn_soft, |ui| {
                     let hosts: Vec<&str> = failed.iter().map(|h| h.host.as_str()).collect();
-                    ui.label(RichText::new(format!("Can't reach {}. Is the VPN up?", hosts.join(", "))).family(theme::medium()));
+                    ui.label(
+                        RichText::new(format!("Can't reach {}. Is the VPN up?", hosts.join(", ")))
+                            .family(theme::medium()),
+                    );
                     for h in failed {
                         ui.label(RichText::new(format!("{}: {}", h.host, h.error.as_deref().unwrap_or(""))).size(12.0));
                     }
@@ -289,9 +292,22 @@ impl ProjectView {
             ui.add_space(8.0);
         }
         for t in &detail.targets {
-            let current = self.refs.as_ref().map(|r| self.selected.get(&t.id).cloned().unwrap_or_else(|| r.default_branch.clone()));
+            let current = self
+                .refs
+                .as_ref()
+                .map(|r| self.selected.get(&t.id).cloned().unwrap_or_else(|| r.default_branch.clone()));
             let mut new_selection = None;
-            target_header(ui, p, &self.name, t, self.refs.as_ref(), current.as_deref(), running, &mut new_selection, requests);
+            target_header(
+                ui,
+                p,
+                &self.name,
+                t,
+                self.refs.as_ref(),
+                current.as_deref(),
+                running,
+                &mut new_selection,
+                requests,
+            );
             ui.add_space(8.0);
             theme::card(ui, |ui| {
                 for (i, unit) in t.units.iter().enumerate() {
@@ -365,7 +381,8 @@ fn target_header(
                 "Deploy"
             };
             let target_name = if t.id == "default" { project.to_string() } else { format!("{project} · {}", t.id) };
-            let services: Vec<String> = t.units.iter().map(|u| u.config.service.clone().unwrap_or_else(|| u.id.clone())).collect();
+            let services: Vec<String> =
+                t.units.iter().map(|u| u.config.service.clone().unwrap_or_else(|| u.id.clone())).collect();
             let disabled_reason = if running.is_some() {
                 "A run is already in progress in this project"
             } else {
@@ -413,13 +430,24 @@ fn ref_picker(ui: &mut Ui, target: &str, refs: &RefList, current: &str, new_sele
     egui::ComboBox::from_id_salt(("ref", target))
         .width(280.0)
         .height(480.0)
-        .selected_text(if sel == refs.default_branch { latest.clone() } else { short(&ref_label(Some(refs), Some(&sel))) })
+        .selected_text(if sel == refs.default_branch {
+            latest.clone()
+        } else {
+            short(&ref_label(Some(refs), Some(&sel)))
+        })
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut sel, refs.default_branch.clone(), latest);
             ui.separator();
-            ui.label(theme::caption(format!("Recent commits on {}", refs.default_branch.trim_start_matches("origin/"))));
+            ui.label(theme::caption(format!(
+                "Recent commits on {}",
+                refs.default_branch.trim_start_matches("origin/")
+            )));
             for c in &refs.commits {
-                ui.selectable_value(&mut sel, c.sha.clone(), format!("{}  {}  ·  {}", c.short, short(&c.subject), c.author));
+                ui.selectable_value(
+                    &mut sel,
+                    c.sha.clone(),
+                    format!("{}  {}  ·  {}", c.short, short(&c.subject), c.author),
+                );
             }
             let branches: Vec<_> = refs.refs.iter().filter(|r| r.kind == "branch").collect();
             if !branches.is_empty() {
@@ -519,7 +547,12 @@ fn containers(ui: &mut Ui, p: &Palette, unit: &Unit, cfg: &UnitConfig, cx: &Unit
     let running: Vec<(&str, &Container)> = status
         .hosts
         .iter()
-        .flat_map(|h| h.containers.iter().filter(|c| own_container(unit, c) && c.state == "running").map(move |c| (h.host.as_str(), c)))
+        .flat_map(|h| {
+            h.containers
+                .iter()
+                .filter(|c| own_container(unit, c) && c.state == "running")
+                .map(move |c| (h.host.as_str(), c))
+        })
         .collect();
     let accessories: Vec<(&str, &str, Option<&Container>)> = cfg
         .accessories
@@ -528,7 +561,12 @@ fn containers(ui: &mut Ui, p: &Palette, unit: &Unit, cfg: &UnitConfig, cx: &Unit
             let found: Vec<(&str, &str, Option<&Container>)> = status
                 .hosts
                 .iter()
-                .flat_map(|h| h.containers.iter().filter(|c| c.service == a.service).map(move |c| (a.name.as_str(), h.host.as_str(), Some(c))))
+                .flat_map(|h| {
+                    h.containers
+                        .iter()
+                        .filter(|c| c.service == a.service)
+                        .map(move |c| (a.name.as_str(), h.host.as_str(), Some(c)))
+                })
                 .collect();
             if found.is_empty() { vec![(a.name.as_str(), "", None)] } else { found }
         })
@@ -624,7 +662,9 @@ fn unit_menu(ui: &mut Ui, unit: &Unit, cx: &UnitCtx, service: &str, requests: &m
             .filter(|c| own_container(unit, c) && c.state == "running")
             .map(|c| c.version.as_str())
             .collect();
-        for c in status.hosts.iter().flat_map(|h| &h.containers).filter(|c| own_container(unit, c) && c.state != "running") {
+        for c in
+            status.hosts.iter().flat_map(|h| &h.containers).filter(|c| own_container(unit, c) && c.state != "running")
+        {
             if !live.contains(c.version.as_str()) && !rollback.iter().any(|(v, _)| v == &c.version) {
                 let subject = status.versions.get(&c.version).and_then(|v| v.subject.clone()).unwrap_or_default();
                 rollback.push((c.version.clone(), subject));
@@ -671,15 +711,30 @@ fn unit_menu_items(
     };
     {
         if ui.add_enabled(cx.can_deploy, egui::Button::new(format!("Deploy {service} only"))).clicked() {
-            requests.push(confirm(format!("Deploy {service}?"), format!("From {}.", cx.ref_label), "Deploy", false, Action::Deploy, "deploy"));
+            requests.push(confirm(
+                format!("Deploy {service}?"),
+                format!("From {}.", cx.ref_label),
+                "Deploy",
+                false,
+                Action::Deploy,
+                "deploy",
+            ));
             ui.close();
         }
         if ui.add_enabled(cx.can_deploy, egui::Button::new("Redeploy (skip bootstrap)")).clicked() {
-            requests.push(confirm(format!("Redeploy {service}?"), format!("From {}.", cx.ref_label), "Redeploy", false, Action::Redeploy, "redeploy"));
+            requests.push(confirm(
+                format!("Redeploy {service}?"),
+                format!("From {}.", cx.ref_label),
+                "Redeploy",
+                false,
+                Action::Redeploy,
+                "redeploy",
+            ));
             ui.close();
         }
         if rollback.is_empty() {
-            ui.add_enabled(false, egui::Button::new("Roll back to…")).on_disabled_hover_text("No previous versions on the servers");
+            ui.add_enabled(false, egui::Button::new("Roll back to…"))
+                .on_disabled_hover_text("No previous versions on the servers");
         } else {
             ui.menu_button("Roll back to", |ui| {
                 for (version, subject) in rollback {
@@ -703,7 +758,14 @@ fn unit_menu_items(
             });
         }
         if ui.button("Reboot (app boot)").clicked() {
-            requests.push(confirm(format!("Reboot {service}?"), "Boots the current version again.".into(), "Reboot", false, Action::AppBoot, "app boot"));
+            requests.push(confirm(
+                format!("Reboot {service}?"),
+                "Boots the current version again.".into(),
+                "Reboot",
+                false,
+                Action::AppBoot,
+                "app boot",
+            ));
             ui.close();
         }
         ui.separator();
@@ -716,7 +778,14 @@ fn unit_menu_items(
             ui.close();
         }
         if ui.add(theme::danger(ui, "Release lock…")).clicked() {
-            requests.push(confirm("Release the deploy lock?".into(), "Only do this when no deploy is running.".into(), "Release", true, Action::LockRelease, "lock release"));
+            requests.push(confirm(
+                "Release the deploy lock?".into(),
+                "Only do this when no deploy is running.".into(),
+                "Release",
+                true,
+                Action::LockRelease,
+                "lock release",
+            ));
             ui.close();
         }
         ui.separator();
@@ -724,7 +793,8 @@ fn unit_menu_items(
             ui.menu_button("Aliases", |ui| {
                 for a in &cfg.aliases {
                     let is_interactive = interactive(&a.command);
-                    let label = if is_interactive { format!("{}  (copy for terminal)", a.name) } else { a.name.clone() };
+                    let label =
+                        if is_interactive { format!("{}  (copy for terminal)", a.name) } else { a.name.clone() };
                     if ui.button(label).on_hover_text(&a.command).clicked() {
                         if is_interactive {
                             ui.ctx().copy_text(format!("kamal {} {args}", a.name));
@@ -768,7 +838,9 @@ fn base_image_line(ui: &mut Ui, p: &Palette, unit: &Unit, status: Option<&Projec
     let Some(base) = &unit.base_image else { return };
     let mut running: Vec<(String, Option<String>)> = Vec::new();
     if let Some(status) = status {
-        for c in status.hosts.iter().flat_map(|h| &h.containers).filter(|c| own_container(unit, c) && c.state == "running") {
+        for c in
+            status.hosts.iter().flat_map(|h| &h.containers).filter(|c| own_container(unit, c) && c.state == "running")
+        {
             if let Some(v) = &c.image_version {
                 let entry = (images::release_of(v).to_string(), c.image_source.clone());
                 if !running.contains(&entry) {

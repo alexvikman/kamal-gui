@@ -104,22 +104,19 @@ fn parse_commits(out: &str) -> Vec<Commit> {
 
 pub fn resolve(mirror: &Path, rev: &str) -> Result<Commit> {
     let rev = format!("{rev}^{{commit}}");
-    let out = run(git(mirror).args(["log", "-1", LOG_FORMAT, &rev, "--"]))
+    let out = run(git(mirror).args(["log", "-1", LOG_FORMAT, "--end-of-options", &rev, "--"]))
         .with_context(|| format!("unknown revision {rev}"))?;
     parse_commits(&out).into_iter().next().context("empty commit")
 }
 
 pub fn log(mirror: &Path, rev: &str, n: usize) -> Result<Vec<Commit>> {
-    let out = run(git(mirror).args(["log", &format!("-{n}"), LOG_FORMAT, rev, "--"]))?;
+    let out = run(git(mirror).args(["log", &format!("-{n}"), LOG_FORMAT, "--end-of-options", rev, "--"]))?;
     Ok(parse_commits(&out))
 }
 
 /// Number of commits on `rev` that `sha` lacks. None if `sha` is unknown.
 pub fn behind(mirror: &Path, sha: &str, rev: &str) -> Option<u32> {
-    run(git(mirror).args(["rev-list", "--count", &format!("{sha}..{rev}")]))
-        .ok()?
-        .parse()
-        .ok()
+    run(git(mirror).args(["rev-list", "--count", "--end-of-options", &format!("{sha}..{rev}")])).ok()?.parse().ok()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,16 +162,12 @@ pub fn refs(mirror: &Path) -> Result<Vec<GitRef>> {
 }
 
 pub fn list_config_files(mirror: &Path, rev: &str) -> Result<Vec<String>> {
-    let out = run(git(mirror).args(["ls-tree", "--name-only", rev, "config/"]))?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.strip_prefix("config/"))
-        .map(String::from)
-        .collect())
+    let out = run(git(mirror).args(["ls-tree", "--name-only", "--end-of-options", rev, "config/"]))?;
+    Ok(out.lines().filter_map(|l| l.strip_prefix("config/")).map(String::from).collect())
 }
 
 pub fn show(mirror: &Path, rev: &str, path: &str) -> Option<String> {
-    run(git(mirror).args(["show", &format!("{rev}:{path}")])).ok()
+    run(git(mirror).args(["show", "--end-of-options", &format!("{rev}:{path}")])).ok()
 }
 
 /// Check out `sha` in the project's deploy worktree (created on first use)
@@ -190,10 +183,7 @@ pub fn prepare_worktree(project: &str, mirror: &Path, sha: &str) -> Result<PathB
         }
         std::fs::create_dir_all(wt.parent().unwrap())?;
         let _ = run(git(mirror).args(["worktree", "prune"]));
-        run(git(mirror)
-            .args(["worktree", "add", "--quiet", "--force", "-B", DEPLOY_BRANCH])
-            .arg(&wt)
-            .arg(sha))?;
+        run(git(mirror).args(["worktree", "add", "--quiet", "--force", "-B", DEPLOY_BRANCH]).arg(&wt).arg(sha))?;
     }
     let head = run(git_in(&wt).args(["rev-parse", "HEAD"]))?;
     if head != sha {

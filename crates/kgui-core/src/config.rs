@@ -126,11 +126,7 @@ pub fn extract(v: &Value) -> UnitConfig {
     let ssh = v.get("ssh");
     let ssh = SshTarget {
         user: ssh.and_then(|x| x.get("user")).and_then(s).unwrap_or_else(|| "root".into()),
-        port: ssh
-            .and_then(|x| x.get("port"))
-            .and_then(s)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(22),
+        port: ssh.and_then(|x| x.get("port")).and_then(s).and_then(|p| p.parse().ok()).unwrap_or(22),
         proxy: ssh.and_then(|x| x.get("proxy")).and_then(s),
     };
 
@@ -145,10 +141,7 @@ pub fn extract(v: &Value) -> UnitConfig {
     }
 
     let aliases = match v.get("aliases") {
-        Some(Value::Mapping(m)) => m
-            .iter()
-            .filter_map(|(k, v)| Some(Alias { name: s(k)?, command: s(v)? }))
-            .collect(),
+        Some(Value::Mapping(m)) => m.iter().filter_map(|(k, v)| Some(Alias { name: s(k)?, command: s(v)? })).collect(),
         _ => vec![],
     };
 
@@ -158,9 +151,10 @@ pub fn extract(v: &Value) -> UnitConfig {
             .iter()
             .filter_map(|(k, av)| {
                 let name = s(k)?;
-                let svc = av.get("service").and_then(s).unwrap_or_else(|| {
-                    format!("{}-{}", service.clone().unwrap_or_default(), name)
-                });
+                let svc = av
+                    .get("service")
+                    .and_then(s)
+                    .unwrap_or_else(|| format!("{}-{}", service.clone().unwrap_or_default(), name));
                 let mut hosts = Vec::new();
                 if let Some(h) = av.get("host").and_then(s) {
                     hosts.push(h);
@@ -195,10 +189,8 @@ mod tests {
 
     #[test]
     fn roles_and_hosts() {
-        let v = parse(
-            "service: a\nservers:\n  web:\n    - 10.0.0.1\n  horizon:\n    hosts:\n      - 10.0.0.2: tag\n",
-        )
-        .unwrap();
+        let v = parse("service: a\nservers:\n  web:\n    - 10.0.0.1\n  horizon:\n    hosts:\n      - 10.0.0.2: tag\n")
+            .unwrap();
         let c = extract(&v);
         assert_eq!(c.service.as_deref(), Some("a"));
         assert_eq!(c.servers.len(), 2);

@@ -26,9 +26,7 @@ pub fn binary(settings: &Settings) -> PathBuf {
 
 fn installed_kamal() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let mise = std::env::var_os("MISE_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/mise"));
+    let mise = std::env::var_os("MISE_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share/mise"));
     let roots = [
         mise.join("installs/ruby"),
         home.join(".rbenv/versions"),
@@ -115,7 +113,8 @@ mod tests {
 
     #[test]
     fn ruby_versions_sort_numerically() {
-        let mut v = [version_key(Path::new("3.10.0")), version_key(Path::new("3.4.1")), version_key(Path::new("ruby-3.2.2"))];
+        let mut v =
+            [version_key(Path::new("3.10.0")), version_key(Path::new("3.4.1")), version_key(Path::new("ruby-3.2.2"))];
         v.sort();
         assert_eq!(v[2], vec![3, 10, 0]);
         assert_eq!(v[0], vec![3, 2, 2]);

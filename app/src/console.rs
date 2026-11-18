@@ -391,7 +391,10 @@ impl Console {
                     job.wrap.max_width = width;
                     job.wrap.break_anywhere = true;
                     let galley = ui.fonts_mut(|f| f.layout_job(job));
-                    let rect = egui::Rect::from_min_size(origin + egui::vec2(0.0, top), egui::vec2(width, rows.tops[r + 1] - top));
+                    let rect = egui::Rect::from_min_size(
+                        origin + egui::vec2(0.0, top),
+                        egui::vec2(width, rows.tops[r + 1] - top),
+                    );
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.add(egui::Label::new(galley));
                     });
@@ -460,8 +463,7 @@ fn tab(ui: &mut Ui, title: &str, status: Status, active: bool) -> TabClick {
                     click = TabClick::Close;
                 }
             });
-        })
-        ;
+        });
     click
 }
 

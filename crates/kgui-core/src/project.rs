@@ -32,10 +32,8 @@ fn registry_path() -> PathBuf {
 }
 
 pub fn list() -> Vec<Project> {
-    let mut projects: Vec<Project> = std::fs::read_to_string(registry_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut projects: Vec<Project> =
+        std::fs::read_to_string(registry_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     projects
 }
@@ -48,10 +46,7 @@ fn save(projects: &[Project]) -> Result<()> {
 }
 
 pub fn find(name: &str) -> Result<Project> {
-    list()
-        .into_iter()
-        .find(|p| p.name == name)
-        .with_context(|| format!("no project named {name}"))
+    list().into_iter().find(|p| p.name == name).with_context(|| format!("no project named {name}"))
 }
 
 /// `git@github.com:org/app.git`, `https://github.com/org/app` → `app`.
@@ -158,10 +153,7 @@ fn group_of(stem: &str) -> String {
 
 /// Build targets from the file names in `config/` and a reader for
 /// `config/<name>` contents.
-pub fn build_targets(
-    files: &[String],
-    read: impl Fn(&str) -> Option<String>,
-) -> (Vec<Target>, Vec<String>) {
+pub fn build_targets(files: &[String], read: impl Fn(&str) -> Option<String>) -> (Vec<Target>, Vec<String>) {
     let names: BTreeSet<&str> = files.iter().map(|s| s.as_str()).filter(|n| is_deploy_file(n)).collect();
     let mut groups: BTreeMap<String, Vec<Unit>> = BTreeMap::new();
     let mut errors = Vec::new();
@@ -179,9 +171,9 @@ pub fn build_targets(
 
         let full = config::has_key(&parsed, "servers")
             && (config::has_key(&parsed, "registry") || config::has_key(&parsed, "builder"));
-        let overlay_of = stem.rsplit_once('.').filter(|(base, dest)| {
-            *dest != "workers" && names.contains(format!("{base}.yml").as_str())
-        });
+        let overlay_of = stem
+            .rsplit_once('.')
+            .filter(|(base, dest)| *dest != "workers" && names.contains(format!("{base}.yml").as_str()));
 
         let (unit, group) = match overlay_of {
             Some((base_stem, dest)) if !full => {
@@ -229,7 +221,8 @@ pub fn build_targets(
     for unit in groups.values_mut().flatten() {
         let path = unit.config.dockerfile.clone().unwrap_or_else(|| "Dockerfile".into());
         let text = dockerfiles.entry(path.clone()).or_insert_with(|| read(&path));
-        unit.base_image = text.as_deref().and_then(|t| crate::images::base_image(t, unit.config.build_target.as_deref()));
+        unit.base_image =
+            text.as_deref().and_then(|t| crate::images::base_image(t, unit.config.build_target.as_deref()));
     }
 
     let mut targets: Vec<Target> = groups
@@ -255,13 +248,7 @@ pub fn load_detail(project: Project) -> Result<ProjectDetail> {
     if targets.is_empty() && errors.is_empty() {
         errors.push(format!("no config/deploy*.yml on {rev}"));
     }
-    Ok(ProjectDetail {
-        commit: git::resolve(&mirror, &rev).ok(),
-        default_branch: rev,
-        targets,
-        errors,
-        project,
-    })
+    Ok(ProjectDetail { commit: git::resolve(&mirror, &rev).ok(), default_branch: rev, targets, errors, project })
 }
 
 /// Targets from config files on disk (the deploy worktree).
@@ -276,8 +263,10 @@ pub fn targets_in_dir(dir: &Path) -> (Vec<Target>, Vec<String>) {
 mod tests {
     use super::*;
 
-    const FULL: &str = "service: s\nimage: i\nservers:\n  web:\n    - 10.0.0.1\nregistry:\n  username: u\nbuilder:\n  arch: amd64\n";
-    const WORKERS: &str = "service: s-workers\nservers:\n  horizon:\n    hosts:\n      - 10.0.0.1\nbuilder:\n  arch: amd64\n";
+    const FULL: &str =
+        "service: s\nimage: i\nservers:\n  web:\n    - 10.0.0.1\nregistry:\n  username: u\nbuilder:\n  arch: amd64\n";
+    const WORKERS: &str =
+        "service: s-workers\nservers:\n  horizon:\n    hosts:\n      - 10.0.0.1\nbuilder:\n  arch: amd64\n";
 
     fn targets(files: &[(&str, &str)]) -> Vec<Target> {
         let names: Vec<String> = files.iter().map(|(n, _)| n.to_string()).collect();
@@ -324,11 +313,7 @@ mod tests {
 
     #[test]
     fn standalone_tenants() {
-        let t = targets(&[
-            ("deploy.yml", FULL),
-            ("deploy.acme.yml", FULL),
-            ("deploy.acme.workers.yml", WORKERS),
-        ]);
+        let t = targets(&[("deploy.yml", FULL), ("deploy.acme.yml", FULL), ("deploy.acme.workers.yml", WORKERS)]);
         let acme = t.iter().find(|t| t.id == "acme").unwrap();
         assert_eq!(acme.units[0].kamal_args(), vec!["-c", "config/deploy.acme.yml"]);
         assert_eq!(acme.units[1].kamal_args(), vec!["-c", "config/deploy.acme.workers.yml"]);

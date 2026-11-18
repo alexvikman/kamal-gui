@@ -286,7 +286,8 @@ impl KamalApp {
     fn guard_quit(&mut self, ctx: &egui::Context) {
         let runs_active = !self.console.running_projects().is_empty();
         let shortcut = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)
         });
         let close_requested = ctx.input(|i| i.viewport().close_requested());
 
@@ -351,7 +352,13 @@ impl KamalApp {
                     let label = format!("{} {}", p.unit_kind, args.join(" "));
                     self.perform(
                         ctx,
-                        Intent::Run { project: p.project, units: vec![p.unit_id], action: Action::Custom { args }, git_ref: None, label },
+                        Intent::Run {
+                            project: p.project,
+                            units: vec![p.unit_id],
+                            action: Action::Custom { args },
+                            git_ref: None,
+                            label,
+                        },
                     );
                 }
             }

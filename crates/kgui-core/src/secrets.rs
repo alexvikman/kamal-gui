@@ -30,12 +30,9 @@ impl SecretRef {
         let rest = s.strip_prefix("op://").with_context(|| format!("not an op:// reference: {s}"))?;
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
-            [v, i, f] if ![v, i, f].iter().any(|p| p.is_empty()) => Ok(Self {
-                vault: v.to_string(),
-                item: i.to_string(),
-                section: None,
-                field: f.to_string(),
-            }),
+            [v, i, f] if ![v, i, f].iter().any(|p| p.is_empty()) => {
+                Ok(Self { vault: v.to_string(), item: i.to_string(), section: None, field: f.to_string() })
+            }
             [v, i, s, f] if ![v, i, s, f].iter().any(|p| p.is_empty()) => Ok(Self {
                 vault: v.to_string(),
                 item: i.to_string(),
@@ -84,9 +81,7 @@ fn secret_files(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Whether any secrets file still calls the old bash adapter.
 pub fn uses_legacy_adapter(dir: &Path) -> bool {
-    secret_files(dir)
-        .iter()
-        .any(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("op-read-item-field")))
+    secret_files(dir).iter().any(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("op-read-item-field")))
 }
 
 /// Files Kamal reads secrets from for one config: `<path>-common` and
@@ -111,7 +106,8 @@ pub fn missing_files_problem(dir: &Path, secrets_path: Option<&str>, destination
     }
     let main = &files[0];
     let example = dir.join(format!("{main}.example")).is_file();
-    let ignored = command("git").arg("-C").arg(dir).args(["check-ignore", "-q", main]).status().is_ok_and(|s| s.success());
+    let ignored =
+        command("git").arg("-C").arg(dir).args(["check-ignore", "-q", main]).status().is_ok_and(|s| s.success());
     if !example && !ignored {
         return None;
     }
@@ -130,11 +126,8 @@ pub fn missing_files_problem(dir: &Path, secrets_path: Option<&str>, destination
 }
 
 pub fn scan_dir(dir: &Path) -> Vec<SecretRef> {
-    let set: BTreeSet<SecretRef> = secret_files(dir)
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .flat_map(|t| scan(&t))
-        .collect();
+    let set: BTreeSet<SecretRef> =
+        secret_files(dir).iter().filter_map(|p| std::fs::read_to_string(p).ok()).flat_map(|t| scan(&t)).collect();
     set.into_iter().collect()
 }
 
@@ -273,8 +266,7 @@ pub fn migrate_legacy(text: &str) -> Option<String> {
     .unwrap();
     let mut changed = false;
     let replaced = call.replace_all(text, |c: &regex::Captures| {
-        let helper_ok = !c[1].starts_with('$')
-            || expand(&c[1]).is_some_and(|h| h.ends_with("op-read-item-field"));
+        let helper_ok = !c[1].starts_with('$') || expand(&c[1]).is_some_and(|h| h.ends_with("op-read-item-field"));
         match (helper_ok, value(&c[2]), value(&c[3]), value(&c[4])) {
             (true, Some(item), Some(field), Some(vault)) => {
                 changed = true;
@@ -295,11 +287,7 @@ pub fn migrate_legacy(text: &str) -> Option<String> {
         .collect();
     let mut out: String = replaced
         .lines()
-        .filter(|l| {
-            assign
-                .captures(l.trim())
-                .is_none_or(|c| !unused.contains(&c.get(1).unwrap().as_str()))
-        })
+        .filter(|l| assign.captures(l.trim()).is_none_or(|c| !unused.contains(&c.get(1).unwrap().as_str())))
         .collect::<Vec<_>>()
         .join("\n");
     if text.ends_with('\n') {
@@ -314,7 +302,8 @@ mod tests {
 
     #[test]
     fn parse_and_scan() {
-        let t = "# c\nA=$(kgui secret op://deploy/app/APP_KEY)\nB=$(kgui secret \"op://deploy/docker-hub/PW\")\nC=$OTHER\n";
+        let t =
+            "# c\nA=$(kgui secret op://deploy/app/APP_KEY)\nB=$(kgui secret \"op://deploy/docker-hub/PW\")\nC=$OTHER\n";
         let refs = scan(t);
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].item, "app");
@@ -338,10 +327,7 @@ mod tests {
     #[test]
     fn migrate() {
         let t = "X=$(bash ~/scripts/kamal-1password-adapter/op-read-item-field my-app APP_KEY deploy)\nY=1\n";
-        assert_eq!(
-            migrate_legacy(t).unwrap(),
-            "X=$(kgui secret op://deploy/my-app/APP_KEY)\nY=1\n"
-        );
+        assert_eq!(migrate_legacy(t).unwrap(), "X=$(kgui secret op://deploy/my-app/APP_KEY)\nY=1\n");
         assert!(migrate_legacy("Y=1\n").is_none());
     }
 
