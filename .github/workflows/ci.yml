@@ -10,9 +10,11 @@ on:
 permissions:
   contents: read
 
+# PR runs replace each other; pushes to main queue instead, so every run on
+# main finishes (and saves its build cache) and every commit gets a nightly.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +32,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main writes the cache, so a PR can't poison what nightly uses.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -49,6 +54,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy -p kgui-core -p kgui-cli --all-targets --locked -- -D warnings
       - name: Test
@@ -67,6 +74,9 @@ jobs:
     concurrency:
       group: nightly
       cancel-in-progress: true
+    env:
+      # Baked into the binary (About window, update checks) and the bundle.
+      KGUI_VERSION: 0.1.0-nightly.${{ github.run_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -95,7 +105,6 @@ jobs:
       - name: Bundle and package
         env:
           KGUI_BIN: dist/kamal-gui
-          KGUI_VERSION: 0.1.0-nightly.${{ github.run_number }}
         run: |
           ./scripts/bundle-macos.sh
           ditto -c -k --keepParent "target/release/bundle/Kamal GUI.app" dist/KamalGUI-nightly-macos-universal.zip
