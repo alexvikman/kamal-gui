@@ -6,6 +6,28 @@ deploys to the checkout you're working in.
 
 [![CI](https://github.com/alexvikman/kamal-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/alexvikman/kamal-gui/actions/workflows/ci.yml)
 
+## Opinionated
+
+Kamal GUI is built around one way of working with Kamal and doesn't try to
+support every setup. If yours differs, the CLI is still there.
+
+- **Deploy what's on the remote, never your working copy.** Only pushed commits
+  can be deployed: the app clones from origin and deploys from its own worktree.
+  Uncommitted or unpushed changes are invisible to it by design.
+- **Secrets live in 1Password, references live in git.** `.kamal/secrets` is
+  committed and only contains `$(kgui secret op://…)` references. A deploy stops
+  early if the secrets file isn't in the commit.
+- **Config by convention.** `config/deploy.yml` is the app, `config/deploy.workers.yml`
+  its workers; `deploy.<name>.yml` is a Kamal destination when it only overrides
+  a few keys and a separate config when it's complete.
+- **Status comes from the servers.** What's running is read from Docker over ssh
+  (Kamal's container labels), not from any local record.
+- **One run per project at a time,** and you can't start another until it's done.
+- **macOS and GitHub first.** Built for macOS, uses `gh` to find repositories and
+  releases, and the system `ssh`, `git`, `op` and `kamal` as they are configured
+  on your machine.
+- **Kamal 2.**
+
 ## Install
 
 Every push to `main` that passes CI publishes a
