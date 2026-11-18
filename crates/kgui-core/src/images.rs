@@ -5,7 +5,7 @@
 //! `org.opencontainers.image.source`) that images like serversideup/php set
 //! and that the app image inherits.
 
-use crate::env::{command, run};
+use crate::env::{command, run_within};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -108,12 +108,15 @@ pub fn latest_release(source: &str) -> Option<Release> {
         return r.clone();
     }
     let repo = github_repo(source)?;
-    let result = run(command("gh").args([
-        "api",
-        &format!("repos/{repo}/releases/latest"),
-        "--jq",
-        "[.tag_name, .published_at, .html_url] | @tsv",
-    ]))
+    let result = run_within(
+        command("gh").args([
+            "api",
+            &format!("repos/{repo}/releases/latest"),
+            "--jq",
+            "[.tag_name, .published_at, .html_url] | @tsv",
+        ]),
+        Duration::from_secs(20),
+    )
     .ok()
     .and_then(|out| {
         let mut p = out.split('\t');

@@ -122,6 +122,73 @@ pub fn with_ssh<T>(f: impl FnOnce() -> T) -> T {
 pub fn run(cmd: &mut Command) -> Result<String> {
     let desc = describe(cmd);
     let out = cmd.stdin(Stdio::null()).output().with_context(|| format!("could not start `{desc}`"))?;
+    check_output(&desc, out)
+}
+
+/// [`run`] with a time limit (see [`output_within`]).
+pub fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String> {
+    let desc = describe(cmd);
+    let out = output_within(cmd, timeout)?;
+    check_output(&desc, out)
+}
+
+/// A command gave no answer in time and was stopped.
+#[derive(Debug)]
+pub struct TimedOut(pub Duration);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no answer within {} s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Like `Command::output`, but stops waiting after `timeout`: the command and
+/// everything it started (ssh under git, say) run in their own process group,
+/// which is killed. The error is then a [`TimedOut`].
+pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    let desc = describe(cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("could not start `{desc}`"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            let _ = child.wait();
+            let _ = (stdout.join(), stderr.join());
+            return Err(TimedOut(timeout).into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+fn check_output(desc: &str, out: std::process::Output) -> Result<String> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("`{desc}` failed ({}): {}", out.status, stderr.trim());
@@ -146,6 +213,17 @@ mod tests {
     use std::time::Duration;
 
     /// The first SSH use runs alone; nothing overlaps it.
+    #[test]
+    fn output_within_stops_the_whole_group() {
+        let started = Instant::now();
+        let err = output_within(Command::new("sh").args(["-c", "sleep 30 & sleep 30"]), Duration::from_millis(300))
+            .unwrap_err();
+        assert!(err.downcast_ref::<TimedOut>().is_some(), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let out = run_within(Command::new("sh").args(["-c", "echo hi"]), Duration::from_secs(5)).unwrap();
+        assert_eq!(out, "hi");
+    }
+
     #[test]
     fn first_ssh_use_runs_alone() {
         let active = Arc::new(AtomicUsize::new(0));

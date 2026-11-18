@@ -136,7 +136,7 @@ fn fetch(args: &[String]) -> Result<()> {
 fn status_cmd(args: &[String]) -> Result<()> {
     let name = one(args, "kgui status PROJECT")?;
     let detail = project::load_detail(project::find(name)?)?;
-    let st = status::project_status(&detail);
+    let st = status::project_status(&detail, &status::Progress::default());
     for h in &st.hosts {
         match &h.error {
             Some(e) => println!("{}: ERROR {e}", h.host),

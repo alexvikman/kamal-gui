@@ -11,6 +11,7 @@ use kgui_core::kamal::{AccessoryVerb, Action};
 use kgui_core::project::{self, ProjectDetail, Target, Unit};
 use kgui_core::status::{self, Container, ProjectStatus};
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
@@ -43,6 +44,10 @@ pub struct ProjectView {
     fetch: Option<Task<ProjectDetail>>,
     refs_task: Option<Task<RefList>>,
     status_task: Option<Task<ProjectStatus>>,
+    /// What the status check is waiting on, and since when.
+    status_progress: status::Progress,
+    status_started: Option<Instant>,
+    fetch_started: Option<Instant>,
     fetched_at: Option<i64>,
     error: Option<String>,
     /// Selected ref per target id.
@@ -62,6 +67,9 @@ impl ProjectView {
             fetch: None,
             refs_task: None,
             status_task: None,
+            status_progress: status::Progress::default(),
+            status_started: None,
+            fetch_started: None,
             fetched_at: None,
             error: None,
             selected: HashMap::new(),
@@ -85,6 +93,7 @@ impl ProjectView {
     }
 
     fn fetch_origin(&mut self, ctx: &egui::Context) {
+        self.fetch_started = Some(Instant::now());
         let n = self.name.clone();
         self.fetch = Some(Task::spawn(ctx, move || {
             project::fetch(&n)?;
@@ -94,10 +103,24 @@ impl ProjectView {
 
     fn refresh_status(&mut self, ctx: &egui::Context) {
         let n = self.name.clone();
+        let progress = status::Progress::default();
+        self.status_progress = progress.clone();
+        self.status_started = Some(Instant::now());
         self.status_task = Some(Task::spawn(ctx, move || {
             let detail = project::load_detail(project::find(&n)?)?;
-            Ok(status::project_status(&detail))
+            Ok(status::project_status(&detail, &progress))
         }));
+    }
+
+    /// Stop waiting for a fetch that hangs. Its git process is stopped by its
+    /// own time limit; until then, carry on with the local clone.
+    fn stop_fetch(&mut self, ctx: &egui::Context) {
+        self.fetch = None;
+        self.fetch_started = None;
+        self.load_refs(ctx);
+        if self.status.is_none() && self.status_task.is_none() {
+            self.refresh_status(ctx);
+        }
     }
 
     /// Coming back to an open project: refresh in the background when the
@@ -138,10 +161,14 @@ impl ProjectView {
             Some(Ok(d)) => {
                 self.detail = Some(d);
                 self.fetched_at = Some(chrono::Utc::now().timestamp_millis());
-                self.load_refs(ctx);
             }
             Some(Err(e)) => self.error = Some(format!("Fetching from origin failed: {e}")),
             None => {}
+        }
+        if fetch_finished {
+            self.fetch_started = None;
+            // Also after a failed fetch: the local clone still has refs.
+            self.load_refs(ctx);
         }
         if fetch_finished && self.status.is_none() && self.status_task.is_none() {
             self.refresh_status(ctx);
@@ -156,6 +183,61 @@ impl ProjectView {
             Some(Ok(s)) => self.status = Some(s),
             Some(Err(e)) => self.error = Some(e),
             None => {}
+        }
+        if self.status_task.is_none() {
+            self.status_started = None;
+        }
+    }
+
+    /// What's being fetched or checked right now, how long it has taken, and
+    /// a way to stop waiting.
+    fn activity(&mut self, ui: &mut Ui, p: &Palette) {
+        const SLOW: Duration = Duration::from_secs(8);
+        let ctx = ui.ctx().clone();
+        let secs = |t: Instant| t.elapsed().as_secs();
+        let mut slow = false;
+        let mut stop_fetch = false;
+        let mut stop_status = false;
+        let line = |ui: &mut Ui, text: String, stop: &mut bool| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(text).size(12.5).color(p.muted));
+                if theme::link(ui, "Stop").on_hover_text("Stop waiting and use what's there").clicked() {
+                    *stop = true;
+                }
+            });
+        };
+        if let Some(t) = self.fetch_started.filter(|_| self.fetch.is_some()) {
+            slow |= t.elapsed() > SLOW;
+            line(ui, format!("Fetching from origin… {} s", secs(t)), &mut stop_fetch);
+        }
+        if let Some(t) = self.status_started.filter(|_| self.status_task.is_some()) {
+            let active = self.status_progress.active();
+            slow |= active.iter().any(|s| s.started.elapsed() > SLOW);
+            let text = if active.is_empty() {
+                format!("Checking the servers… {} s", secs(t))
+            } else {
+                let what: Vec<String> = active.iter().map(|s| format!("{} ({} s)", s.label, secs(s.started))).collect();
+                format!("Waiting for {}", what.join(", "))
+            };
+            line(ui, text, &mut stop_status);
+        }
+        if slow {
+            ui.label(theme::caption(format!(
+                "No answer yet. If 1Password asks to approve an SSH key, approve it; otherwise check that the VPN is on. Servers get {} s.",
+                status::HOST_TIMEOUT.as_secs()
+            )));
+        }
+        if self.fetch.is_some() || self.status_task.is_some() {
+            ui.add_space(10.0);
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if stop_fetch {
+            self.stop_fetch(&ctx);
+        }
+        if stop_status {
+            self.status_task = None;
+            self.status_started = None;
         }
     }
 
@@ -289,6 +371,7 @@ impl ProjectView {
     }
 
     fn overview(&mut self, ui: &mut Ui, p: &Palette, requests: &mut Vec<Request>, running: Option<&RunningRun>) {
+        self.activity(ui, p);
         if let Some(s) = &self.status {
             let failed: Vec<_> = s.hosts.iter().filter(|h| !h.ok).collect();
             if !failed.is_empty() {
@@ -344,6 +427,7 @@ impl ProjectView {
                     let cx = UnitCtx {
                         project: &self.name,
                         status: self.status.as_ref(),
+                        checking: self.status_task.is_some() || self.fetch.is_some(),
                         git_ref: current.clone(),
                         ref_label: ref_label(self.refs.as_ref(), current.as_deref()),
                         can_deploy: self.refs.is_some() && running.is_none(),
@@ -501,6 +585,8 @@ fn ref_picker(ui: &mut Ui, target: &str, refs: &RefList, current: &str, new_sele
 struct UnitCtx<'a> {
     project: &'a str,
     status: Option<&'a ProjectStatus>,
+    /// A status check is under way (or waiting on the fetch).
+    checking: bool,
     git_ref: Option<String>,
     ref_label: String,
     can_deploy: bool,
@@ -611,7 +697,12 @@ fn containers(
     let mut unit_menu: Option<&mut dyn FnMut(&mut Ui)> = Some(unit_menu);
     let Some(status) = cx.status else {
         let hosts: Vec<String> = cfg.servers.iter().map(|s| format!("{} on {}", s.role, s.host)).collect();
-        line_with_menu(ui, theme::caption(format!("Checking {}…", hosts.join(", "))), &mut unit_menu);
+        let text = if cx.checking {
+            format!("Checking {}…", hosts.join(", "))
+        } else {
+            format!("Status of {} not checked. Refresh to try again.", hosts.join(", "))
+        };
+        line_with_menu(ui, theme::caption(text), &mut unit_menu);
         return;
     };
     let unit_hosts: BTreeSet<&str> = cfg.servers.iter().map(|s| s.host.as_str()).collect();

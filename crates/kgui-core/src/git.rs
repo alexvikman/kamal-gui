@@ -2,12 +2,13 @@
 //! clone of its GitHub origin under the data dir, and deploys run in a
 //! worktree checked out at the chosen commit.
 
-use crate::env::{command, run};
+use crate::env::{command, run, run_within};
 use crate::settings::data_dir;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Branch the deploy worktree sits on. Kamal clones the worktree for its
 /// build and fetches from it, so HEAD must be on a branch, not detached.
@@ -71,10 +72,13 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
             std::fs::remove_dir_all(&dir)?;
         }
         // `--` ends option parsing: the URL can never be taken as a flag.
-        run(command("git")
-            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
-            .args(["clone", "--bare", "--quiet", "--", origin])
-            .arg(&dir))
+        run_within(
+            command("git")
+                .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+                .args(["clone", "--bare", "--quiet", "--", origin])
+                .arg(&dir),
+            CLONE_TIMEOUT,
+        )
         .with_context(|| format!("could not clone {origin}"))?;
         run(git(&dir).args(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]))?;
         // Never let stray secrets files make Kamal see an "uncommitted" tree.
@@ -87,10 +91,20 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Time limits for talking to origin. They include waiting for the SSH agent
+/// (1Password) to approve the key, so they're generous; they're there so a
+/// dead connection fails instead of hanging the app.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn fetch(mirror: &Path) -> Result<()> {
-    run(git(mirror)
-        .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
-        .args(["fetch", "--quiet", "--prune", "--tags", "origin"]))?;
+    run_within(
+        git(mirror)
+            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+            .args(["fetch", "--quiet", "--prune", "--tags", "origin"]),
+        FETCH_TIMEOUT,
+    )
+    .context("git fetch from origin")?;
     let _ = run(git(mirror).args(["remote", "set-head", "origin", "--auto"]));
     Ok(())
 }

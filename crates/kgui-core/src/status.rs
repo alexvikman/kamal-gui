@@ -7,6 +7,44 @@ use crate::env::command;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long one host may take to answer, including the SSH agent (1Password)
+/// asking for approval on first use.
+pub const HOST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What a status check is doing right now, for the UI. Cheap to clone; all
+/// clones share the same steps.
+#[derive(Clone, Default)]
+pub struct Progress(Arc<Mutex<Vec<Step>>>);
+
+#[derive(Debug, Clone)]
+pub struct Step {
+    /// e.g. "10.0.0.28" or "GitHub releases".
+    pub label: String,
+    pub started: Instant,
+    pub done: bool,
+}
+
+impl Progress {
+    fn start(&self, label: impl Into<String>) -> usize {
+        let mut steps = self.0.lock().unwrap();
+        steps.push(Step { label: label.into(), started: Instant::now(), done: false });
+        steps.len() - 1
+    }
+
+    fn finish(&self, i: usize) {
+        if let Some(step) = self.0.lock().unwrap().get_mut(i) {
+            step.done = true;
+        }
+    }
+
+    /// Steps that are still going.
+    pub fn active(&self) -> Vec<Step> {
+        self.0.lock().unwrap().iter().filter(|s| !s.done).cloned().collect()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Container {
@@ -68,7 +106,21 @@ pub fn ssh_command(host: &str, ssh: &SshTarget) -> Result<std::process::Command>
         check_ssh_value(proxy, "proxy", "@,")?;
     }
     let mut c = command("ssh");
-    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-p"]).arg(ssh.port.to_string()).arg("-l").arg(&ssh.user);
+    // Keepalives make a connection that drops mid-command fail within ~15 s.
+    c.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=3",
+    ])
+    .arg("-p")
+    .arg(ssh.port.to_string())
+    .arg("-l")
+    .arg(&ssh.user);
     if let Some(proxy) = &ssh.proxy {
         c.arg("-J").arg(proxy);
     }
@@ -77,28 +129,39 @@ pub fn ssh_command(host: &str, ssh: &SshTarget) -> Result<std::process::Command>
     Ok(c)
 }
 
-pub fn host_status(host: &str, ssh: &SshTarget) -> HostStatus {
-    match containers(host, ssh) {
+pub fn host_status(host: &str, ssh: &SshTarget, progress: &Progress) -> HostStatus {
+    match containers(host, ssh, progress) {
         Ok(containers) => HostStatus { host: host.into(), ok: true, error: None, containers },
         Err(e) => HostStatus { host: host.into(), ok: false, error: Some(format!("{e:#}")), containers: vec![] },
     }
 }
 
-fn containers(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
-    crate::env::with_ssh(|| containers_inner(host, ssh))
+fn containers(host: &str, ssh: &SshTarget, progress: &Progress) -> Result<Vec<Container>> {
+    crate::env::with_ssh(|| {
+        let step = progress.start(host);
+        let result = containers_inner(host, ssh);
+        progress.finish(step);
+        result
+    })
 }
 
 fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // One round trip: the container list, then each container's full label map
     // (`docker ps` flattens labels into a comma-separated string, which breaks
     // on values that contain commas).
-    let output = ssh_command(host, ssh)?
-        .arg(format!(
+    let mut output = ssh_command(host, ssh)?;
+    output.arg(format!(
             "docker ps -a --no-trunc --filter label=service --format '{{{{json .}}}}'; echo {MARK}; \
              docker ps -aq --filter label=service | xargs -r docker inspect --format '{{{{json .Name}}}}{{{{\"\\t\"}}}}{{{{json .Config.Labels}}}}'"
-        ))
-        .stdin(std::process::Stdio::null())
-        .output()?;
+        ));
+    let output = match crate::env::output_within(&mut output, HOST_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) if e.is::<crate::env::TimedOut>() => anyhow::bail!(
+            "no answer within {} s (is the VPN on, or is 1Password waiting for you to approve the SSH key?)",
+            HOST_TIMEOUT.as_secs()
+        ),
+        Err(e) => return Err(e),
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let msg = stderr.trim().trim_start_matches("ssh: ");
@@ -142,9 +205,9 @@ fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
 }
 
 /// Status of several hosts in parallel.
-pub fn hosts_status(hosts: &[(String, SshTarget)]) -> Vec<HostStatus> {
+pub fn hosts_status(hosts: &[(String, SshTarget)], progress: &Progress) -> Vec<HostStatus> {
     std::thread::scope(|s| {
-        let handles: Vec<_> = hosts.iter().map(|(h, ssh)| s.spawn(move || host_status(h, ssh))).collect();
+        let handles: Vec<_> = hosts.iter().map(|(h, ssh)| s.spawn(move || host_status(h, ssh, progress))).collect();
         handles.into_iter().map(|h| h.join().expect("ssh thread panicked")).collect()
     })
 }
@@ -167,7 +230,7 @@ pub struct ProjectStatus {
 
 /// Containers of this project's services (apps and accessories) on every
 /// host the project uses, plus commit info for each running version.
-pub fn project_status(detail: &crate::project::ProjectDetail) -> ProjectStatus {
+pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progress) -> ProjectStatus {
     let mut services = std::collections::HashSet::new();
     let mut hosts: Vec<(String, SshTarget)> = Vec::new();
     for unit in detail.targets.iter().flat_map(|t| &t.units) {
@@ -185,7 +248,7 @@ pub fn project_status(detail: &crate::project::ProjectDetail) -> ProjectStatus {
         }
     }
 
-    let mut result = hosts_status(&hosts);
+    let mut result = hosts_status(&hosts, progress);
     for h in &mut result {
         h.containers.retain(|c| services.contains(&c.service));
     }
@@ -213,6 +276,7 @@ pub fn project_status(detail: &crate::project::ProjectDetail) -> ProjectStatus {
     }
     let sources: std::collections::BTreeSet<&str> =
         result.iter().flat_map(|h| &h.containers).filter_map(|c| c.image_source.as_deref()).collect();
+    let step = (!sources.is_empty()).then(|| progress.start("GitHub releases"));
     let releases = std::thread::scope(|s| {
         let handles: Vec<_> = sources
             .into_iter()
@@ -220,6 +284,9 @@ pub fn project_status(detail: &crate::project::ProjectDetail) -> ProjectStatus {
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).filter_map(|(s, r)| Some((s, r?))).collect()
     });
+    if let Some(step) = step {
+        progress.finish(step);
+    }
     ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms() }
 }
 
