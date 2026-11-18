@@ -783,7 +783,9 @@ fn containers(
                 version_url: cx.repo.as_ref().map(|r| format!("{r}/commit/{sha}")),
                 note: info.and_then(|i| i.subject.as_deref()).unwrap_or(""),
                 freshness,
-                detail: format!("{host}  ·  {}", c.status),
+                host,
+                deployed: docker_time_ms(&c.created),
+                detail: &c.status,
                 logs: true,
                 accessory: None,
             },
@@ -809,7 +811,9 @@ fn containers(
                 version_url: None,
                 note: "accessory",
                 freshness: None,
-                detail: format!("{host}  ·  {}", c.status),
+                host,
+                deployed: None,
+                detail: &c.status,
                 logs: true,
                 accessory: menu,
             },
@@ -821,7 +825,9 @@ fn containers(
                 version_url: None,
                 note: "accessory",
                 freshness: None,
-                detail: if all_unreachable { "status unknown" } else { "not running" }.to_string(),
+                host: "",
+                deployed: None,
+                detail: if all_unreachable { "status unknown" } else { "not running" },
                 logs: false,
                 accessory: menu,
             },
@@ -921,7 +927,13 @@ struct ContainerLine<'a> {
     /// "latest" / "3 behind", its color and an optional compare link.
     freshness: Option<(String, egui::Color32, Option<String>)>,
     /// Host and uptime, shown underneath in grey.
-    detail: String,
+    /// Where it runs.
+    host: &'a str,
+    /// When the container was created: by the deploy (or boot) that started
+    /// this version, whether it ran from here or from the kamal CLI.
+    deployed: Option<i64>,
+    /// Docker's state, e.g. "Up 2 hours (healthy)".
+    detail: &'a str,
     logs: bool,
     /// Accessories get their own actions menu.
     accessory: Option<AccessoryMenu>,
@@ -999,10 +1011,27 @@ fn container_block(
     });
     ui.horizontal(|ui| {
         ui.add_space(18.0);
-        ui.label(RichText::new(line.detail).size(12.0).color(p.muted));
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let muted = |s: String| RichText::new(s).size(12.0).color(p.muted);
+        let sep = "  ·  ";
+        if !line.host.is_empty() {
+            ui.label(muted(format!("{}{sep}", line.host)));
+        }
+        if let Some(t) = line.deployed {
+            ui.label(muted(format!("Deployed {}", theme::ago(t)))).on_hover_text(theme::date_time(t));
+            ui.label(muted(sep.into()));
+        }
+        ui.label(muted(line.detail.to_string()));
     });
     ui.add_space(10.0);
     click
+}
+
+/// Docker's `CreatedAt` (`2026-11-18 20:20:13 +0100 CET`) as Unix ms.
+fn docker_time_ms(s: &str) -> Option<i64> {
+    let mut parts = s.split_whitespace();
+    let stamp = format!("{} {} {}", parts.next()?, parts.next()?, parts.next()?);
+    chrono::DateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S %z").ok().map(|d| d.timestamp_millis())
 }
 
 fn unit_menu(ui: &mut Ui, unit: &Unit, cx: &UnitCtx, service: &str, requests: &mut Vec<Request>) {
@@ -1346,5 +1375,19 @@ mod bench {
         }
         let targets = view.detail.as_ref().map(|d| d.targets.len()).unwrap_or(0);
         println!("{name}: {targets} targets  steady frame {:?}", t.elapsed() / n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_docker_created_at() {
+        let ms = docker_time_ms("2026-11-18 20:20:13 +0100 CET").unwrap();
+        assert_eq!(ms, 1_795_029_613_000);
+        assert_eq!(docker_time_ms("2026-11-18 19:20:13 +0000 UTC"), Some(ms));
+        assert_eq!(docker_time_ms("About an hour ago"), None);
+        assert_eq!(docker_time_ms(""), None);
     }
 }

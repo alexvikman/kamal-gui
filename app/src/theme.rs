@@ -357,12 +357,22 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 }
 
 pub fn ago(ms: i64) -> String {
-    let s = (chrono::Utc::now().timestamp_millis() - ms).max(0) / 1000;
+    ago_from(chrono::Utc::now().timestamp_millis(), ms)
+}
+
+fn ago_from(now: i64, ms: i64) -> String {
+    const DAY: i64 = 86_400;
+    let s = (now - ms).max(0) / 1000;
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
     match s {
         0..60 => format!("{s}s ago"),
         60..3600 => format!("{}m ago", s / 60),
-        3600..86400 => format!("{}h ago", s / 3600),
-        _ => date_time(ms),
+        3600..DAY => format!("{}h ago", s / 3600),
+        DAY..172_800 => "yesterday".into(),
+        _ if s < 14 * DAY => plural(s / DAY, "day"),
+        _ if s < 60 * DAY => plural(s / (7 * DAY), "week"),
+        _ if s < 365 * DAY => plural(s / (30 * DAY), "month"),
+        _ => plural(s / (365 * DAY), "year"),
     }
 }
 
@@ -393,6 +403,21 @@ pub fn short_version(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_times() {
+        let now = 1_800_000_000_000;
+        let ago = |secs: i64| ago_from(now, now - secs * 1000);
+        assert_eq!(ago(42), "42s ago");
+        assert_eq!(ago(59 * 60), "59m ago");
+        assert_eq!(ago(5 * 3600), "5h ago");
+        assert_eq!(ago(30 * 3600), "yesterday");
+        assert_eq!(ago(3 * 86_400), "3 days ago");
+        assert_eq!(ago(15 * 86_400), "2 weeks ago");
+        assert_eq!(ago(7 * 86_400), "7 days ago");
+        assert_eq!(ago(90 * 86_400), "3 months ago");
+        assert_eq!(ago(400 * 86_400), "1 year ago");
+    }
     use egui::{Event, Pos2, RawInput, Rect, Shape};
 
     /// Paint a primary button and return its blue rect and that rect's stroke.
