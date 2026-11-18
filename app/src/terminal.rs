@@ -5,7 +5,10 @@
 
 use crate::ansi;
 use crate::console::{BG, TEXT};
-use egui::{Align2, Color32, CornerRadius, EventFilter, FontId, Key, Modifiers, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{
+    Align2, Button, Color32, CornerRadius, EventFilter, FontId, Key, KeyboardShortcut, Modifiers, PointerButton, Rect,
+    Sense, Stroke, Ui, pos2, vec2,
+};
 use kgui_core::runner::{CommandSpec, Status};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -158,7 +161,8 @@ impl Terminal {
         let cols = ((rect.width() / cell_w).floor() as u16).max(10);
         self.resize(rows, cols);
 
-        if resp.clicked() || resp.drag_started() || std::mem::take(&mut self.focus_next) {
+        let primary_drag = resp.drag_started_by(PointerButton::Primary);
+        if resp.clicked() || primary_drag || std::mem::take(&mut self.focus_next) {
             resp.request_focus();
         }
         let focused = resp.has_focus();
@@ -172,12 +176,10 @@ impl Terminal {
             row: (((p.y - rect.top()) / row_h).floor().max(0.0) as u16).min(rows - 1),
             col: (((p.x - rect.left()) / cell_w).round().max(0.0) as u16).min(cols),
         };
-        if resp.drag_started()
-            && let Some(p) = resp.interact_pointer_pos()
-        {
+        if primary_drag && let Some(p) = resp.interact_pointer_pos() {
             let at = cell_at(p);
             self.selection = Some((at, at));
-        } else if resp.dragged()
+        } else if resp.dragged_by(PointerButton::Primary)
             && let (Some(p), Some((_, end))) = (resp.interact_pointer_pos(), self.selection.as_mut())
         {
             *end = cell_at(p);
@@ -200,10 +202,63 @@ impl Terminal {
             }
         }
 
+        self.context_menu(&resp);
         if focused {
             self.input(ui);
         }
         self.paint(ui, rect, row_h, cell_w, &font, focused);
+    }
+
+    /// Right-click menu. A right click keeps the selection so it can be copied.
+    fn context_menu(&mut self, resp: &egui::Response) {
+        enum Pick {
+            Copy,
+            Paste,
+            SelectAll,
+            CopyAll,
+            ClearSelection,
+        }
+        let mut pick = None;
+        let has_selection = self.selected_text().is_some();
+        let running = self.status() == Status::Running;
+        resp.context_menu(|ui| {
+            let ctx = ui.ctx().clone();
+            let shortcut = |key| ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key));
+            let mut item = |ui: &mut Ui, enabled: bool, button: Button, choice: Pick| {
+                if ui.add_enabled(enabled, button).clicked() {
+                    pick = Some(choice);
+                    ui.close();
+                }
+            };
+            item(ui, has_selection, Button::new("Copy").shortcut_text(shortcut(Key::C)), Pick::Copy);
+            item(ui, running, Button::new("Paste").shortcut_text(shortcut(Key::V)), Pick::Paste);
+            ui.separator();
+            item(ui, true, Button::new("Select all").shortcut_text(shortcut(Key::A)), Pick::SelectAll);
+            item(ui, true, Button::new("Copy all output"), Pick::CopyAll);
+            item(ui, has_selection, Button::new("Clear selection"), Pick::ClearSelection);
+        });
+        let Some(pick) = pick else { return };
+        let ctx = &resp.ctx;
+        match pick {
+            Pick::Copy => {
+                if let Some(text) = self.selected_text() {
+                    ctx.copy_text(text);
+                }
+            }
+            // The window reads the clipboard and sends it back as a paste
+            // event next frame, which `input` cleans up like Cmd+V.
+            Pick::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Pick::SelectAll => self.select_all(),
+            Pick::CopyAll => ctx.copy_text(self.text()),
+            Pick::ClearSelection => self.selection = None,
+        }
+        self.focus_next = true;
+    }
+
+    /// Select everything on screen.
+    fn select_all(&mut self) {
+        let (rows, cols) = self.shared.parser.lock().unwrap().screen().size();
+        self.selection = Some((Pos { row: 0, col: 0 }, Pos { row: rows.get() - 1, col: cols.get() }));
     }
 
     fn input(&mut self, ui: &mut Ui) {
@@ -230,6 +285,9 @@ impl Terminal {
                     if let Some(text) = self.selected_text() {
                         ui.ctx().copy_text(text);
                     }
+                }
+                egui::Event::Key { key: Key::A, pressed: true, modifiers, .. } if modifiers.command => {
+                    self.select_all();
                 }
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
@@ -648,6 +706,16 @@ mod tests {
                 assert!(term.text().contains("red inverse 漢字 x"), "{}", term.text());
             }
         }
+    }
+
+    #[test]
+    fn select_all_copies_the_screen() {
+        let mut term = sh("echo first; echo second; sleep 5");
+        wait_until(|| term.text().contains("second"));
+        assert_eq!(term.selected_text(), None);
+        term.select_all();
+        let copied = term.selected_text().unwrap();
+        assert!(copied.contains("first") && copied.contains("second"), "{copied}");
     }
 
     #[test]
