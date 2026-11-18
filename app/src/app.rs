@@ -70,6 +70,12 @@ pub struct KamalApp {
     quit_dialog: bool,
     /// The user chose to stop the runs and quit; close once they've ended.
     quitting: bool,
+    menu: crate::menu::AppMenu,
+    about: Option<crate::about::About>,
+    /// Background check for a newer nightly (on start and every few hours).
+    update_check: Option<crate::task::Task<crate::update::Release>>,
+    last_update_check: Option<std::time::Instant>,
+    update_available: Option<crate::update::Release>,
 }
 
 impl KamalApp {
@@ -96,6 +102,11 @@ impl KamalApp {
             add: None,
             error: None,
             quit_dialog: false,
+            menu: crate::menu::install(&cc.egui_ctx),
+            about: None,
+            update_check: None,
+            last_update_check: None,
+            update_available: None,
             quitting: false,
         }
     }
@@ -172,6 +183,14 @@ impl KamalApp {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if let Some(r) = self.update_available.clone().filter(|r| r.is_newer()) {
+                    let label = RichText::new("Update available").color(theme::ACCENT);
+                    if theme::quiet_rich(ui, label).on_hover_text(format!("{} is out", r.title)).clicked() {
+                        self.about = Some(crate::about::About::new(&ctx, Some(r)));
+                    }
+                }
+            });
             ui.horizontal(|ui| {
                 if theme::quiet(ui, "+  Add project").clicked() {
                     self.add = Some(AddDialog::new(&ctx));
@@ -283,12 +302,13 @@ impl KamalApp {
 
     /// Closing the window or pressing Cmd+Q/Cmd+W while a kamal run is in
     /// progress asks first: quitting would cut the deploy off halfway.
-    fn guard_quit(&mut self, ctx: &egui::Context) {
+    fn guard_quit(&mut self, ctx: &egui::Context, menu_quit: bool) {
         let runs_active = !self.console.running_projects().is_empty();
-        let shortcut = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)
-                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)
-        });
+        let shortcut = menu_quit
+            || ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)
+            });
         let close_requested = ctx.input(|i| i.viewport().close_requested());
 
         if self.quitting {
@@ -311,7 +331,58 @@ impl KamalApp {
         }
     }
 
+    /// Handle clicks in the macOS menu bar. Returns true for Quit/Close.
+    fn menu_actions(&mut self, ctx: &egui::Context) -> bool {
+        use crate::menu::MenuAction;
+        let mut quit = false;
+        while let Ok(action) = self.menu.actions.try_recv() {
+            match action {
+                MenuAction::About | MenuAction::CheckForUpdates => {
+                    self.about = Some(crate::about::About::new(ctx, self.update_available.clone()));
+                }
+                MenuAction::Settings => self.settings = Some(SettingsDialog::new()),
+                MenuAction::AddProject => self.add = Some(AddDialog::new(ctx)),
+                MenuAction::CloseWindow | MenuAction::Quit => quit = true,
+                MenuAction::OpenGithub => ctx.open_url(egui::OpenUrl::new_tab(crate::build_info::repo_url())),
+                MenuAction::OpenKamalDocs => ctx.open_url(egui::OpenUrl::new_tab("https://kamal-deploy.org/docs/")),
+            }
+        }
+        quit
+    }
+
+    /// Look for a newer nightly when the app starts and every six hours.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        // Offline or rate-limited: try again next round, quietly.
+        if let Some(Ok(release)) = crate::task::poll(&mut self.update_check) {
+            self.update_available = Some(release);
+        }
+        if self.update_check.is_none() && self.last_update_check.is_none_or(|t| t.elapsed() > EVERY) {
+            self.last_update_check = Some(std::time::Instant::now());
+            self.update_check = Some(crate::task::Task::spawn(ctx, crate::update::check));
+        }
+        ctx.request_repaint_after(EVERY);
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(about) = &mut self.about {
+            let runs_active = !self.console.running_projects().is_empty();
+            match about.ui(ctx, runs_active) {
+                crate::about::AboutResult::Open => {
+                    if let Some(r) = about.latest() {
+                        self.update_available = Some(r.clone());
+                    }
+                }
+                crate::about::AboutResult::Close => self.about = None,
+                crate::about::AboutResult::Relaunch(bundle) => match crate::update::relaunch(&bundle) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => {
+                        self.error = Some(format!("Update installed, but {e:#}. Restart the app manually."));
+                        self.about = None;
+                    }
+                },
+            }
+        }
         if self.quit_dialog || self.quitting {
             let runs: Vec<String> = self
                 .console
@@ -396,7 +467,9 @@ impl eframe::App for KamalApp {
             // Keep elapsed times and spinners moving.
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
-        self.guard_quit(&ctx);
+        let menu_quit = self.menu_actions(&ctx);
+        self.poll_updates(&ctx);
+        self.guard_quit(&ctx, menu_quit);
 
         let mut requests = Vec::new();
         let scope = self.current.clone();

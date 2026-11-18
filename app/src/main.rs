@@ -1,11 +1,15 @@
+mod about;
 mod ansi;
 mod app;
+mod build_info;
 mod console;
 mod dialogs;
 mod history_view;
+mod menu;
 mod project_view;
 mod task;
 mod theme;
+mod update;
 
 use kgui_core::{env, history::History, settings};
 

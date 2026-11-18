@@ -42,6 +42,15 @@ Every push to `main` that passes CI publishes a
 Each artifact has signed build provenance:
 `gh attestation verify <file> -R alexvikman/kamal-gui`.
 
+### Updates
+
+The app checks for a newer nightly at start and every six hours ("Update
+available" in the sidebar). **Kamal GUI → About Kamal GUI** (or **Check for
+Updates…**) shows the version and commit you're on and installs the update:
+it downloads the release, checks the SHA-256 checksum and, when `gh` is signed
+in, the signed build provenance, verifies the bundle id and signature, swaps the
+app in place and relaunches. Updating is disabled while a deploy is running.
+
 ## How it works
 
 - **Projects are added to the app**, either by picking repositories from GitHub
@@ -150,3 +159,8 @@ see `app/assets/fonts/Geist-OFL.txt`) with SF Mono for code when available.
   app copies the command for you. A built-in terminal (pty) is planned.
 - One run per project at a time, since runs share the deploy worktree.
 - Kamal runs locally: images are built on your Mac and the servers must be reachable.
+
+## License
+
+[MIT](LICENSE). The bundled [Geist](https://vercel.com/font) font is under the
+SIL Open Font License (`app/assets/fonts/Geist-OFL.txt`).
