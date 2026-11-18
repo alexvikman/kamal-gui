@@ -36,8 +36,9 @@ impl HistoryView {
         }
     }
 
-    /// Returns a run the user clicked.
-    pub fn ui(&mut self, ui: &mut Ui) -> Option<Run> {
+    /// Returns a run the user clicked. `repo_of` gives a project's GitHub
+    /// URL, for commit links.
+    pub fn ui(&mut self, ui: &mut Ui, repo_of: &dyn Fn(&str) -> Option<String>) -> Option<Run> {
         let p = theme::palette(ui);
         if let Some(e) = &self.error {
             ui.colored_label(p.bad, e);
@@ -112,7 +113,12 @@ impl HistoryView {
                         });
                         row.col(|ui| {
                             if let Some(sha) = &r.sha {
-                                ui.label(RichText::new(&sha[..sha.len().min(7)]).monospace());
+                                let url = repo_of(&r.project).map(|repo| format!("{repo}/commit/{sha}"));
+                                theme::subtle_link(
+                                    ui,
+                                    RichText::new(&sha[..sha.len().min(7)]).monospace(),
+                                    url.as_deref(),
+                                );
                                 ui.add(egui::Label::new(theme::caption(r.subject.as_deref().unwrap_or(""))).truncate());
                             }
                         });
@@ -213,7 +219,7 @@ mod tests {
             for _ in 0..3 {
                 let mut out = ctx.run_ui(input.clone(), |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        view.ui(ui);
+                        view.ui(ui, &|_| None);
                     });
                 });
                 out.textures_delta.clear();

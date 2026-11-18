@@ -315,6 +315,34 @@ pub fn short_url(url: &str) -> String {
     s.to_string()
 }
 
+/// `git@github.com:org/app.git` → `https://github.com/org/app`; None for
+/// repositories that aren't on GitHub.
+pub fn github_web(url: &str) -> Option<String> {
+    let s = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    ["git@github.com:", "ssh://git@github.com/", "https://github.com/", "http://github.com/"]
+        .iter()
+        .find_map(|prefix| s.strip_prefix(prefix))
+        .map(|rest| format!("https://github.com/{rest}"))
+}
+
+/// Text that opens `url` in the browser: looks like the surrounding text,
+/// underlined with a hand cursor on hover. Plain text when `url` is None.
+pub fn subtle_link(ui: &mut Ui, text: RichText, url: Option<&str>) -> egui::Response {
+    let Some(url) = url else { return ui.label(text) };
+    let r = ui
+        .add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Open on GitHub");
+    if r.hovered() {
+        let color = ui.visuals().text_color().gamma_multiply(0.6);
+        ui.painter().hline(r.rect.x_range(), r.rect.bottom() - 1.0, Stroke::new(1.0, color));
+    }
+    if r.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    r
+}
+
 pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let p = palette(ui);
     egui::Frame::new()
@@ -386,6 +414,13 @@ mod tests {
             });
         }
         found.expect("no primary button painted")
+    }
+
+    #[test]
+    fn github_web_urls() {
+        assert_eq!(github_web("git@github.com:org/app.git").as_deref(), Some("https://github.com/org/app"));
+        assert_eq!(github_web("https://github.com/org/app").as_deref(), Some("https://github.com/org/app"));
+        assert_eq!(github_web("git@gitlab.com:org/app.git"), None);
     }
 
     #[test]

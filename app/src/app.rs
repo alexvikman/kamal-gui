@@ -272,7 +272,9 @@ impl KamalApp {
         }
         ui.heading(theme::title("All runs", 20.0));
         ui.add_space(6.0);
-        if let Some(run) = self.all_history.ui(ui) {
+        let projects = &self.projects;
+        let repo_of = |name: &str| projects.iter().find(|p| p.name == name).and_then(|p| theme::github_web(&p.url));
+        if let Some(run) = self.all_history.ui(ui, &repo_of) {
             requests.push(Request::OpenRunLog(run));
         }
     }

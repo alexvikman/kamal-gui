@@ -180,7 +180,8 @@ impl ProjectView {
                     running_banner(ui, &p, run, requests);
                     ui.add_space(12.0);
                 }
-                if let Some(run) = self.history.ui(ui) {
+                let repo = self.detail.as_ref().and_then(|d| theme::github_web(&d.project.url));
+                if let Some(run) = self.history.ui(ui, &|_| repo.clone()) {
                     requests.push(Request::OpenRunLog(run));
                 }
             }
@@ -220,6 +221,12 @@ impl ProjectView {
             ui.label(theme::title(&self.name, 24.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 theme::more_menu(ui, "Project actions", |ui| {
+                    if let Some(web) = self.detail.as_ref().and_then(|d| theme::github_web(&d.project.url))
+                        && ui.button("Open on GitHub").clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl::new_tab(web));
+                        ui.close();
+                    }
                     if ui.button("Fetch from origin").clicked() {
                         self.fetch_origin(ctx);
                         ui.close();
@@ -250,15 +257,35 @@ impl ProjectView {
             });
         });
 
+        let muted = |s: String| RichText::new(s).size(12.5).color(p.muted);
         let mut parts = Vec::new();
-        if let Some(d) = &self.detail {
-            parts.push(theme::short_url(&d.project.url));
-            let branch = d.default_branch.trim_start_matches("origin/").to_string();
-            match &d.commit {
-                Some(c) => parts.push(format!("{branch} @ {} {}", c.short, truncate(&c.subject, 60))),
-                None => parts.push(branch),
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if let Some(d) = &self.detail {
+                let web = theme::github_web(&d.project.url);
+                theme::subtle_link(ui, muted(theme::short_url(&d.project.url)), web.as_deref());
+                ui.label(muted("  ·  ".into()));
+                let branch = d.default_branch.trim_start_matches("origin/").to_string();
+                let branch_url = web.as_ref().map(|w| format!("{w}/tree/{branch}"));
+                theme::subtle_link(ui, muted(branch), branch_url.as_deref());
+                if let Some(c) = &d.commit {
+                    ui.label(muted(" @ ".into()));
+                    let commit_url = web.as_ref().map(|w| format!("{w}/commit/{}", c.sha));
+                    theme::subtle_link(
+                        ui,
+                        muted(format!("{} {}", c.short, truncate(&c.subject, 60))),
+                        commit_url.as_deref(),
+                    );
+                }
             }
-        }
+            self.header_status(&mut parts);
+            for part in parts {
+                ui.label(muted(format!("  ·  {part}")));
+            }
+        });
+    }
+
+    fn header_status(&self, parts: &mut Vec<String>) {
         if self.fetch.is_some() {
             parts.push("fetching…".into());
         } else if let Some(t) = self.fetched_at {
@@ -267,7 +294,6 @@ impl ProjectView {
         if let Some(s) = &self.status {
             parts.push(format!("status checked {}", theme::ago(s.checked_at)));
         }
-        ui.label(RichText::new(parts.join("  ·  ")).size(12.5).color(p.muted));
     }
 
     fn overview(&mut self, ui: &mut Ui, p: &Palette, requests: &mut Vec<Request>, running: Option<&RunningRun>) {
@@ -331,6 +357,8 @@ impl ProjectView {
                         can_deploy: self.refs.is_some() && running.is_none(),
                         busy: running.is_some(),
                         deploying: running.is_some_and(|r| r.units.contains(&unit.id)),
+                        repo: theme::github_web(&detail.project.url),
+                        branch: detail.default_branch.trim_start_matches("origin/").to_string(),
                     };
                     unit_row(ui, p, unit, &cx, requests);
                 }
@@ -488,6 +516,10 @@ struct UnitCtx<'a> {
     busy: bool,
     /// This unit is part of the run in progress.
     deploying: bool,
+    /// `https://github.com/org/app`, for links.
+    repo: Option<String>,
+    /// Default branch (`master`), for compare links.
+    branch: String,
 }
 
 /// Kamal labels app containers with `service` and, when deployed with -d,
@@ -640,9 +672,15 @@ fn containers(
 
     for (host, c) in &running {
         let info = status.versions.get(&c.version);
+        let sha = c.version.split('_').next().unwrap_or(&c.version);
         let freshness = match info.and_then(|i| i.behind) {
-            Some(0) => Some(("latest".to_string(), p.ok)),
-            Some(n) => Some((format!("{n} behind"), p.warn)),
+            Some(0) => Some(("latest".to_string(), p.ok, None)),
+            // What's on the default branch but not on the server.
+            Some(n) => Some((
+                format!("{n} behind"),
+                p.warn,
+                cx.repo.as_ref().map(|r| format!("{r}/compare/{sha}...{}", cx.branch)),
+            )),
             None => None,
         };
         let open = container_block(
@@ -653,6 +691,7 @@ fn containers(
                 name: c.role.as_deref().unwrap_or("app"),
                 hover: &c.name,
                 version: Some(&c.version),
+                version_url: cx.repo.as_ref().map(|r| format!("{r}/commit/{sha}")),
                 note: info.and_then(|i| i.subject.as_deref()).unwrap_or(""),
                 freshness,
                 detail: format!("{host}  ·  {}", c.status),
@@ -678,6 +717,7 @@ fn containers(
                 name,
                 hover: &c.name,
                 version: None,
+                version_url: None,
                 note: "accessory",
                 freshness: None,
                 detail: format!("{host}  ·  {}", c.status),
@@ -689,6 +729,7 @@ fn containers(
                 name,
                 hover: "",
                 version: None,
+                version_url: None,
                 note: "accessory",
                 freshness: None,
                 detail: if all_unreachable { "status unknown" } else { "not running" }.to_string(),
@@ -775,9 +816,11 @@ struct ContainerLine<'a> {
     name: &'a str,
     hover: &'a str,
     version: Option<&'a str>,
+    version_url: Option<String>,
     /// Commit subject, or "accessory".
     note: &'a str,
-    freshness: Option<(String, egui::Color32)>,
+    /// "latest" / "3 behind", its color and an optional compare link.
+    freshness: Option<(String, egui::Color32, Option<String>)>,
     /// Host and uptime, shown underneath in grey.
     detail: String,
     logs: bool,
@@ -831,8 +874,8 @@ fn container_block(
             if line.logs && theme::link(ui, "Logs").clicked() {
                 click.logs = true;
             }
-            if let Some((text, color)) = &line.freshness {
-                ui.label(RichText::new(text).size(12.5).color(*color));
+            if let Some((text, color, url)) = &line.freshness {
+                theme::subtle_link(ui, RichText::new(text).size(12.5).color(*color), url.as_deref());
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 theme::dot(ui, line.dot);
@@ -841,7 +884,11 @@ fn container_block(
                     name.on_hover_text(line.hover);
                 }
                 if let Some(v) = line.version {
-                    ui.label(RichText::new(theme::short_version(v)).monospace()).on_hover_text(v);
+                    theme::subtle_link(
+                        ui,
+                        RichText::new(theme::short_version(v)).monospace(),
+                        line.version_url.as_deref(),
+                    );
                 }
                 ui.add(egui::Label::new(theme::caption(line.note)).truncate());
             });
@@ -914,6 +961,18 @@ fn unit_menu_items(
         })
     };
     {
+        if let Some(repo) = &cx.repo {
+            // The destination file when there is one, else the config itself.
+            let file = match &unit.destination {
+                Some(d) => format!("{}.{d}.yml", unit.config_file.trim_end_matches(".yml")),
+                None => unit.config_file.clone(),
+            };
+            if ui.button("Open config on GitHub").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{repo}/blob/{}/{file}", cx.branch)));
+                ui.close();
+            }
+            ui.separator();
+        }
         if ui.add_enabled(cx.can_deploy, egui::Button::new(format!("Deploy {service} only"))).clicked() {
             requests.push(confirm(
                 format!("Deploy {service}?"),
