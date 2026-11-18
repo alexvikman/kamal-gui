@@ -217,7 +217,7 @@ impl Terminal {
             match event {
                 egui::Event::Text(t) => out.extend(t.as_bytes()),
                 egui::Event::Paste(t) => {
-                    let t = t.replace("\r\n", "\r").replace('\n', "\r");
+                    let t = paste_text(&t);
                     if bracketed {
                         out.extend(b"\x1b[200~");
                         out.extend(t.as_bytes());
@@ -456,6 +456,22 @@ fn color(c: vt100::Color, default: Color32) -> Color32 {
     }
 }
 
+/// Pasted text as the terminal sends it: newlines become Enter, and other
+/// control characters are dropped. Clipboard text could otherwise carry
+/// escape sequences, such as an early end-of-paste marker (`ESC[201~`) that
+/// makes the rest run as if typed, in a shell on a production server.
+fn paste_text(text: &str) -> String {
+    text.replace("\r\n", "\r")
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\r'),
+            '\t' | '\r' => Some(c),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 /// Bytes a key sends, as in xterm. Text keys arrive as `Event::Text`; this
 /// covers control keys, Ctrl+letter and the navigation keys. Cmd shortcuts
 /// stay with the app.
@@ -555,6 +571,13 @@ mod tests {
         assert_eq!(keys(Key::ArrowLeft, Modifiers::ALT), b"\x1b[1;3D");
         assert_eq!(keys(Key::Delete, Modifiers::NONE), b"\x1b[3~");
         assert_eq!(keys(Key::F5, Modifiers::NONE), b"\x1b[15~");
+    }
+
+    #[test]
+    fn paste_drops_control_characters() {
+        assert_eq!(paste_text("ls\r\ncd x\n"), "ls\rcd x\r");
+        assert_eq!(paste_text("a\x1b[201~rm -rf /\x1b[200~"), "a[201~rm -rf /[200~");
+        assert_eq!(paste_text("tab\there \u{9b}201~ ä"), "tab\there 201~ ä");
     }
 
     #[test]
