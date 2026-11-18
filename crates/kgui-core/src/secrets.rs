@@ -190,21 +190,18 @@ pub fn fetch_item(account: &str, vault: &str, item: &str) -> Result<Item> {
     Ok(Item { fields: parsed.fields })
 }
 
-/// Resolve references, fetching each item once and items in parallel.
-/// Returns `(env_key, value)` pairs.
+/// Resolve references, fetching each item once. Returns `(env_key, value)`.
+///
+/// Items are fetched one after another: 1Password asks to authorize `op`
+/// once, and calls made in parallel before that answer each get their own
+/// prompt.
 pub fn resolve_all(account: &str, refs: &[SecretRef]) -> Result<Vec<(String, String)>> {
     let mut by_item: BTreeMap<(String, String), Vec<&SecretRef>> = BTreeMap::new();
     for r in refs {
         by_item.entry((r.vault.clone(), r.item.clone())).or_default().push(r);
     }
-    let items: HashMap<(String, String), Result<Item>> = std::thread::scope(|s| {
-        let handles: Vec<_> = by_item
-            .keys()
-            .cloned()
-            .map(|key| s.spawn(move || (key.clone(), fetch_item(account, &key.0, &key.1))))
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("op thread panicked")).collect()
-    });
+    let items: HashMap<(String, String), Result<Item>> =
+        by_item.keys().map(|key| (key.clone(), fetch_item(account, &key.0, &key.1))).collect();
 
     let mut out = Vec::new();
     let mut errors = Vec::new();
