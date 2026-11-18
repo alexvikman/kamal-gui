@@ -1,0 +1,11 @@
+[package]
+name = "kgui-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kgui"
+path = "src/main.rs"
+
+[dependencies]
+kgui-core = { path = "../kgui-core" }
