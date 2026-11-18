@@ -16,8 +16,27 @@ use std::sync::mpsc::{self, Receiver};
 
 /// Something the user asked for that the app carries out.
 pub enum Intent {
-    Run { project: String, units: Vec<String>, action: Action, git_ref: Option<String>, label: String },
-    Logs { project: String, host: String, ssh: SshTarget, container: String, label: String },
+    Run {
+        project: String,
+        units: Vec<String>,
+        action: Action,
+        git_ref: Option<String>,
+        label: String,
+    },
+    Logs {
+        project: String,
+        host: String,
+        ssh: SshTarget,
+        container: String,
+        label: String,
+    },
+    /// An interactive kamal command (exec -i, an alias) in a terminal tab.
+    Terminal {
+        project: String,
+        unit_id: String,
+        args: Vec<String>,
+        title: String,
+    },
     Cancel(String),
     RemoveProject(String),
 }
@@ -47,7 +66,6 @@ pub enum Request {
     Confirm(Confirm),
     Prompt(Prompt),
     OpenRunLog(Run),
-    Notice(String),
     /// Bring a console tab to the front.
     FocusSession(String),
 }
@@ -285,11 +303,6 @@ impl KamalApp {
             Request::Confirm(c) => self.confirm = Some(c),
             Request::Prompt(p) => self.prompt = Some(p),
             Request::OpenRunLog(run) => self.console.open_run_log(&run),
-            Request::Notice(n) => {
-                if let Some(v) = self.current.as_ref().and_then(|c| self.views.get_mut(c)) {
-                    v.notice = Some(n);
-                }
-            }
             Request::FocusSession(key) => {
                 self.console.focus(&key);
                 self.console.collapsed = false;
@@ -316,6 +329,10 @@ impl KamalApp {
                 .runner
                 .start_logs(&host, &ssh, &container, 500)
                 .map(|key| self.console.open(Session::new(key, label, Kind::Log, Some(project)))),
+            Intent::Terminal { project, unit_id, args, title } => {
+                self.console.open_terminal(ctx, &self.runner, &project, &unit_id, args, title);
+                Ok(())
+            }
             Intent::Cancel(key) => {
                 self.runner.cancel(&key);
                 Ok(())
@@ -432,16 +449,18 @@ impl KamalApp {
                 let args = dialogs::split_args(text.trim().trim_start_matches("kamal "));
                 if !args.is_empty() {
                     let label = format!("{} {}", p.unit_kind, args.join(" "));
-                    self.perform(
-                        ctx,
+                    let intent = if args.iter().any(|a| a == "-i" || a == "--interactive") {
+                        Intent::Terminal { project: p.project, unit_id: p.unit_id, args, title: label }
+                    } else {
                         Intent::Run {
                             project: p.project,
                             units: vec![p.unit_id],
                             action: Action::Custom { args },
                             git_ref: None,
                             label,
-                        },
-                    );
+                        }
+                    };
+                    self.perform(ctx, intent);
                 }
             }
         }

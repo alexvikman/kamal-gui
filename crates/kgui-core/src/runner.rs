@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -329,36 +330,17 @@ fn execute(
     let settings = Settings::load();
     out.info(format!("› Fetching {project_name} from origin…"));
 
-    let p = project::find(project_name)?;
-    let mirror = git::ensure_mirror(&p.name, &p.url)?;
-    let default = git::default_branch(&mirror);
-    let (rev, from_worktree) = match (action.uses_ref(), git::worktree_head(&p.name)) {
-        (true, _) => (git_ref.unwrap_or(default), false),
-        (false, Some(head)) => (head, true),
-        (false, None) => (default, false),
-    };
-    let commit = git::resolve(&mirror, &rev)?;
+    let co = checkout(project_name, action.uses_ref(), git_ref)?;
+    let (wt, commit) = (co.worktree, co.commit);
     if let Ok(h) = History::open() {
-        let _ = h.set_commit(run_id, &rev, &commit.sha, &commit.subject);
+        let _ = h.set_commit(run_id, &co.rev, &commit.sha, &commit.subject);
     }
-    if from_worktree {
+    if co.from_worktree {
         out.info(format!("› Last deployed commit: {} {}", commit.short, commit.subject));
     } else {
-        out.info(format!("› {rev} → {} {} ({})", commit.short, commit.subject, commit.author));
+        out.info(format!("› {} → {} {} ({})", co.rev, commit.short, commit.subject, commit.author));
     }
-
-    let wt = git::prepare_worktree(&p.name, &mirror, &commit.sha)?;
-    let (targets, _) = project::targets_in_dir(&wt);
-    let all: Vec<&Unit> = targets.iter().flat_map(|t| &t.units).collect();
-    let units: Vec<Unit> = unit_ids
-        .iter()
-        .map(|id| {
-            all.iter()
-                .find(|u| &u.id == id)
-                .map(|u| (*u).clone())
-                .ok_or_else(|| format!("{id} does not exist in commit {}", commit.short))
-        })
-        .collect::<Result<_, _>>()?;
+    let units = find_units(&wt, unit_ids, &commit)?;
 
     if action.needs_secrets() {
         let mut problems: Vec<String> = units
@@ -388,12 +370,7 @@ fn execute(
     }
 
     let kamal_bin = kamal::binary(&settings);
-    // `.kamal/secrets` may call `kamal secrets fetch` itself. Version-manager
-    // shims can't resolve kamal in the app's worktrees, so put its dir first.
-    let path = match kamal_bin.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(dir) => format!("{}:{}", dir.display(), env::path_env()),
-        None => env::path_env(),
-    };
+    let path = path_with(&kamal_bin);
 
     for unit in &units {
         if cancel.load(Ordering::SeqCst) {
@@ -416,6 +393,101 @@ fn execute(
         }
     }
     Ok(())
+}
+
+struct Checkout {
+    rev: String,
+    commit: git::Commit,
+    /// The commit was already in the deploy worktree (not a requested ref).
+    from_worktree: bool,
+    worktree: PathBuf,
+}
+
+/// Fetch the project and check out the commit to run kamal against: the
+/// requested ref for deploys, otherwise whatever the deploy worktree has (the
+/// last deployed commit), falling back to the default branch.
+fn checkout(project_name: &str, uses_ref: bool, git_ref: Option<String>) -> anyhow::Result<Checkout> {
+    let p = project::find(project_name)?;
+    let mirror = git::ensure_mirror(&p.name, &p.url)?;
+    let default = git::default_branch(&mirror);
+    let (rev, from_worktree) = match (uses_ref, git::worktree_head(&p.name)) {
+        (true, _) => (git_ref.unwrap_or(default), false),
+        (false, Some(head)) => (head, true),
+        (false, None) => (default, false),
+    };
+    let commit = git::resolve(&mirror, &rev)?;
+    let worktree = git::prepare_worktree(&p.name, &mirror, &commit.sha)?;
+    Ok(Checkout { rev, commit, from_worktree, worktree })
+}
+
+fn find_units(wt: &Path, unit_ids: &[String], commit: &git::Commit) -> Result<Vec<Unit>, String> {
+    let (targets, _) = project::targets_in_dir(wt);
+    let all: Vec<&Unit> = targets.iter().flat_map(|t| &t.units).collect();
+    unit_ids
+        .iter()
+        .map(|id| {
+            all.iter()
+                .find(|u| &u.id == id)
+                .map(|u| (*u).clone())
+                .ok_or_else(|| format!("{id} does not exist in commit {}", commit.short))
+        })
+        .collect()
+}
+
+/// PATH for kamal processes. `.kamal/secrets` may call `kamal secrets fetch`
+/// itself, and version-manager shims can't resolve kamal in the app's
+/// worktrees, so kamal's own directory goes first.
+fn path_with(kamal_bin: &Path) -> String {
+    match kamal_bin.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => format!("{}:{}", dir.display(), env::path_env()),
+        None => env::path_env(),
+    }
+}
+
+/// A kamal command ready to run in a terminal.
+#[derive(Debug, Clone)]
+pub struct CommandSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub envs: Vec<(String, String)>,
+    /// Shown above the session, e.g. `kamal app exec -i … (abc1234 Fix login)`.
+    pub summary: String,
+}
+
+impl Runner {
+    /// Check out the deployed commit and build the kamal command for an
+    /// interactive session (`kamal app exec -i`, an alias, `accessory exec`).
+    /// Blocks; waits for a run in the same project to finish, since both use
+    /// the deploy worktree. Secrets aren't prefetched: these commands don't
+    /// boot anything, and `kgui secret` reads 1Password itself if one is used.
+    pub fn prepare_interactive(
+        &self,
+        project_name: &str,
+        unit_id: &str,
+        args: &[String],
+    ) -> anyhow::Result<CommandSpec> {
+        anyhow::ensure!(!args.is_empty(), "no kamal command given");
+        let lock = self.project_lock(project_name);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let co = checkout(project_name, false, None)?;
+        let unit = find_units(&co.worktree, &[unit_id.to_string()], &co.commit).map_err(anyhow::Error::msg)?.remove(0);
+        let settings = Settings::load();
+        let program = kamal::binary(&settings);
+        let mut full = args.to_vec();
+        full.extend(unit.kamal_args());
+        Ok(CommandSpec {
+            summary: format!("kamal {} · {} {}", full.join(" "), co.commit.short, co.commit.subject),
+            envs: vec![
+                ("PATH".into(), path_with(&program)),
+                ("KGUI_OP_ACCOUNT".into(), settings.op_account),
+                ("TERM".into(), "xterm-256color".into()),
+            ],
+            program,
+            args: full,
+            cwd: co.worktree,
+        })
+    }
 }
 
 /// Run a command, streaming its output, until it exits or `cancel` is set.

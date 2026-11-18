@@ -1,7 +1,8 @@
-//! Bottom panel: a terminal-style view with one tab per kamal run or log
-//! stream. Tabs belong to a project and only show while that project is open
+//! Bottom panel: a terminal-style view with one tab per kamal run, log
+//! stream or interactive session. Tabs belong to a project and only show while that project is open
 //! ("All runs" shows every tab).
 
+use crate::terminal::Terminal;
 use crate::{ansi, theme};
 use egui::{Color32, CornerRadius, FontId, Margin, RichText, ScrollArea, Stroke, Ui, Visuals};
 use kgui_core::history::Run;
@@ -26,6 +27,8 @@ const OK: Color32 = Color32::from_rgb(0x98, 0xc3, 0x79);
 pub enum Kind {
     Run,
     Log,
+    /// An interactive command in a pseudoterminal.
+    Terminal,
 }
 
 pub struct Session {
@@ -48,6 +51,8 @@ pub struct Session {
     pub status: Status,
     /// A finished run read back from history; nothing to cancel.
     pub replay: bool,
+    /// The screen of an interactive session (`Kind::Terminal`).
+    terminal: Option<Terminal>,
 }
 
 /// Where each visible output line sits. Built incrementally as lines arrive,
@@ -107,6 +112,7 @@ impl Session {
             rows: None,
             status: Status::Running,
             replay: false,
+            terminal: None,
         }
     }
 
@@ -179,6 +185,7 @@ pub struct Console {
     /// Lines for sessions that aren't open (yet).
     pending: HashMap<String, Vec<(Stream, String)>>,
     pending_end: HashMap<String, Status>,
+    terminals_opened: u64,
 }
 
 fn in_scope(s: &Session, scope: Option<&str>) -> bool {
@@ -209,6 +216,27 @@ impl Console {
         self.active.insert(s.project.clone(), key.to_string());
         self.active.insert(None, key.to_string());
         true
+    }
+
+    /// Run an interactive kamal command (`args`, without the unit's `-c`/`-d`)
+    /// for one unit in a new terminal tab.
+    pub fn open_terminal(
+        &mut self,
+        ctx: &egui::Context,
+        runner: &Runner,
+        project: &str,
+        unit_id: &str,
+        args: Vec<String>,
+        title: String,
+    ) {
+        self.terminals_opened += 1;
+        let key = format!("term:{}", self.terminals_opened);
+        let mut session = Session::new(key, title, Kind::Terminal, Some(project.to_string()));
+        session.units = vec![unit_id.to_string()];
+        session.label = args.join(" ");
+        let (runner, project, unit_id) = (runner.clone(), project.to_string(), unit_id.to_string());
+        session.terminal = Some(Terminal::start(ctx, move || runner.prepare_interactive(&project, &unit_id, &args)));
+        self.open(session);
     }
 
     pub fn has_tabs(&self, scope: Option<&str>) -> bool {
@@ -267,6 +295,11 @@ impl Console {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, runner: &Runner, scope: Option<&str>) {
+        for s in &mut self.sessions {
+            if let Some(t) = &s.terminal {
+                s.status = t.status();
+            }
+        }
         *ui.visuals_mut() = terminal_visuals();
         egui::Frame::new().fill(BG).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
@@ -331,21 +364,32 @@ impl Console {
                 ui.add_space(2.0);
                 let Some(s) = active.as_ref().and_then(|k| self.sessions.iter().find(|s| &s.key == k)) else { return };
                 if s.status == Status::Running && !s.replay {
-                    let label = if s.kind == Kind::Log { "Stop" } else { "Cancel" };
+                    let label = if s.kind == Kind::Run { "Cancel" } else { "Stop" };
                     if ui.add(egui::Button::new(RichText::new(label).color(ERROR))).clicked() {
-                        runner.cancel(&s.key);
+                        match &s.terminal {
+                            Some(t) => t.stop(),
+                            None => runner.cancel(&s.key),
+                        }
                     }
                 }
                 if ui.button("Copy").on_hover_text("Copy the whole output").clicked() {
-                    let text = s.lines().iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+                    let text = match &s.terminal {
+                        Some(t) => t.text(),
+                        None => s.lines().iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n"),
+                    };
                     ui.ctx().copy_text(text);
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter…").desired_width(150.0));
+                if s.terminal.is_none() {
+                    ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter…").desired_width(150.0));
+                }
             });
         });
         if let Some(key) = select {
             self.focus(&key);
             self.collapsed = false;
+            if let Some(t) = self.sessions.iter_mut().find(|s| s.key == key).and_then(|s| s.terminal.as_mut()) {
+                t.focus();
+            }
         }
         if let Some(key) = close {
             if let Some(s) = self.sessions.iter().find(|s| s.key == key)
@@ -363,6 +407,10 @@ impl Console {
         let Some(key) = self.active_key(scope) else { return };
         let filter = self.filter.trim().to_lowercase();
         let Some(s) = self.sessions.iter_mut().find(|s| s.key == key) else { return };
+        if let Some(t) = &mut s.terminal {
+            t.ui(ui);
+            return;
+        }
         let font = FontId::monospace(12.5);
         let (row_height, char_width) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
 

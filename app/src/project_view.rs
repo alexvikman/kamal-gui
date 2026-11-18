@@ -45,7 +45,6 @@ pub struct ProjectView {
     status_task: Option<Task<ProjectStatus>>,
     fetched_at: Option<i64>,
     error: Option<String>,
-    pub notice: Option<String>,
     /// Selected ref per target id.
     selected: HashMap<String, String>,
     tab: Tab,
@@ -65,7 +64,6 @@ impl ProjectView {
             status_task: None,
             fetched_at: None,
             error: None,
-            notice: None,
             selected: HashMap::new(),
             tab: Tab::Overview,
             history: HistoryView::new(Some(name.to_string())),
@@ -173,7 +171,7 @@ impl ProjectView {
 
         match self.tab {
             // The history table scrolls (and virtualizes) on its own.
-            // Errors and notices are about the project's state, not its
+            // Errors are about the project's state, not its
             // history; only an in-progress run is shown here.
             Tab::History => {
                 if let Some(run) = running {
@@ -196,21 +194,15 @@ impl ProjectView {
         }
     }
 
-    /// Run in progress, errors and notices, above the tab's content.
+    /// Run in progress and errors, above the tab's content.
     fn banners(&mut self, ui: &mut Ui, p: &Palette, running: Option<&RunningRun>, requests: &mut Vec<Request>) {
         if let Some(run) = running {
             running_banner(ui, p, run, requests);
             ui.add_space(12.0);
         }
-        for (msg, is_error) in [(self.error.clone(), true), (self.notice.clone(), false)] {
-            let Some(msg) = msg else { continue };
-            let (fg, bg) = if is_error { (p.bad, p.bad_soft) } else { (p.warn, p.warn_soft) };
-            if theme::dismissable(ui, fg, bg, &msg) {
-                if is_error {
-                    self.error = None;
-                } else {
-                    self.notice = None;
-                }
+        if let Some(msg) = self.error.clone() {
+            if theme::dismissable(ui, p.bad, p.bad_soft, &msg) {
+                self.error = None;
             }
             ui.add_space(8.0);
         }
@@ -529,6 +521,12 @@ fn own_container(unit: &Unit, c: &Container) -> bool {
     unit.config.service.as_deref() == Some(c.service.as_str()) && c.destination == unit.destination
 }
 
+/// The shell "Open shell" starts in a container: bash when the image has it
+/// (line editing, tab completion), else sh. Kamal passes the command on to the
+/// remote shell as-is, so the inner quotes survive. `exec bash || exec sh`
+/// wouldn't do: sh exits when an exec fails.
+const SHELL: &str = "sh -c 'command -v bash >/dev/null && exec bash || exec sh'";
+
 fn interactive(cmd: &str) -> bool {
     let words: Vec<&str> = cmd.split_whitespace().collect();
     words.contains(&"exec") && (words.contains(&"-i") || words.contains(&"--interactive"))
@@ -746,6 +744,14 @@ fn containers(
         if let Some(verb) = click.accessory {
             requests.push(accessory_request(unit, cx, name, verb));
         }
+        if click.shell {
+            requests.push(Request::Do(Intent::Terminal {
+                project: cx.project.to_string(),
+                unit_id: unit.id.clone(),
+                args: ["accessory", "exec", "-i", "--reuse", name, SHELL].map(String::from).to_vec(),
+                title: format!("{name} shell"),
+            }));
+        }
     }
 }
 
@@ -762,6 +768,8 @@ struct AccessoryMenu {
 struct BlockClick {
     logs: bool,
     accessory: Option<AccessoryVerb>,
+    /// Open a shell in the accessory's container.
+    shell: bool,
 }
 
 fn accessory_request(unit: &Unit, cx: &UnitCtx, name: &str, verb: AccessoryVerb) -> Request {
@@ -863,6 +871,10 @@ fn container_block(
                         item(ui, "Reboot (recreate container)", AccessoryVerb::Reboot, menu.exists);
                         item(ui, "Stop", AccessoryVerb::Stop, menu.exists && (menu.running || menu.unknown));
                         ui.separator();
+                        if (menu.running || menu.unknown) && ui.button("Open shell").clicked() {
+                            click.shell = true;
+                            ui.close();
+                        }
                         item(ui, "Details", AccessoryVerb::Details, true);
                         if menu.exists && ui.add(theme::danger(ui, "Remove…")).clicked() {
                             click.accessory = Some(AccessoryVerb::Remove);
@@ -1052,19 +1064,31 @@ fn unit_menu_items(
             ui.close();
         }
         ui.separator();
+        if ui.button("Open shell").on_hover_text("bash (or sh) in the running container on the primary host").clicked()
+        {
+            requests.push(Request::Do(Intent::Terminal {
+                project: cx.project.to_string(),
+                unit_id: unit.id.clone(),
+                args: ["app", "exec", "-i", "--reuse", SHELL].map(String::from).to_vec(),
+                title: format!("{} shell", unit.kind),
+            }));
+            ui.close();
+        }
         if !cfg.aliases.is_empty() {
             ui.menu_button("Aliases", |ui| {
                 for a in &cfg.aliases {
                     let is_interactive = interactive(&a.command);
-                    let label =
-                        if is_interactive { format!("{}  (copy for terminal)", a.name) } else { a.name.clone() };
-                    if ui.button(label).on_hover_text(&a.command).clicked() {
+                    let label = if is_interactive { format!("{}  ›_", a.name) } else { a.name.clone() };
+                    let hover =
+                        if is_interactive { format!("{}\nOpens in a terminal.", a.command) } else { a.command.clone() };
+                    if ui.button(label).on_hover_text(hover).clicked() {
                         if is_interactive {
-                            ui.ctx().copy_text(format!("kamal {} {args}", a.name));
-                            requests.push(Request::Notice(format!(
-                                "Copied `kamal {} {args}`. \"{}\" is interactive, so run it in a terminal.",
-                                a.name, a.name
-                            )));
+                            requests.push(Request::Do(Intent::Terminal {
+                                project: cx.project.to_string(),
+                                unit_id: unit.id.clone(),
+                                args: vec![a.name.clone()],
+                                title: format!("{} {}", unit.kind, a.name),
+                            }));
                         } else {
                             requests.push(Request::Confirm(Confirm {
                                 title: format!("Run alias {}?", a.name),
@@ -1083,7 +1107,9 @@ fn unit_menu_items(
         if ui.button("Run kamal command…").clicked() {
             requests.push(Request::Prompt(Prompt {
                 title: "Run a kamal command".into(),
-                body: format!("Runs in the deploy worktree with {args}. Commands that need a terminal (exec -i) don't work here yet."),
+                body: format!(
+                    "Runs in the deploy worktree with {args}. Interactive commands (exec -i) open in a terminal."
+                ),
                 hint: "app exec \"php artisan about\"".into(),
                 value: String::new(),
                 project: cx.project.to_string(),

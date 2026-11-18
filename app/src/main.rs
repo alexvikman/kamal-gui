@@ -9,6 +9,7 @@ mod menu;
 mod project_view;
 mod settings_page;
 mod task;
+mod terminal;
 mod theme;
 mod update;
 

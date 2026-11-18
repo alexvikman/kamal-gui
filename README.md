@@ -73,6 +73,11 @@ Updating is disabled while a deploy is running.
   `service`/`role`/`destination` labels). It shows which commit runs where, how far behind the
   default branch it is, and which older versions you can roll back to.
 - **Logs** stream with `docker logs --follow` over ssh into a filterable console.
+- **Interactive commands** (`kamal app exec -i`, aliases like `console`/`tinker`, **Open shell**
+  on a service or accessory) run in a built-in terminal tab: a real pseudoterminal with an
+  xterm-compatible screen (colors, cursor keys, Ctrl+C, paste, scrollback, ⌘C on a selection).
+  They run against the commit in the deploy worktree, like every non-deploy command. Closing the
+  tab hangs up the session. Terminal sessions aren't recorded in History.
 - **History**: every run is stored with its commit, outcome and full output
   (`…/kgui/history.sqlite`, `…/kgui/logs/<id>.log`). Secret values the app fetched for
   the run are replaced with `[REDACTED]` in the output, should a command print one.
@@ -161,8 +166,6 @@ see `app/assets/fonts/Geist-OFL.txt`) with SF Mono for code when available.
 
 ## Current limitations
 
-- Interactive commands (`kamal app exec -i`, aliases like `shell`/`tinker`) need a terminal; the
-  app copies the command for you. A built-in terminal (pty) is planned.
 - One run per project at a time, since runs share the deploy worktree.
 - Kamal runs locally: images are built on your Mac and the servers must be reachable.
 

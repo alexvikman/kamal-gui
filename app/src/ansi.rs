@@ -4,7 +4,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId};
 
 // One Dark-style colors for the black terminal background.
-const COLORS: [Color32; 8] = [
+pub const COLORS: [Color32; 8] = [
     Color32::from_rgb(0x5c, 0x63, 0x70),
     Color32::from_rgb(0xe0, 0x6c, 0x75),
     Color32::from_rgb(0x98, 0xc3, 0x79),
@@ -14,7 +14,7 @@ const COLORS: [Color32; 8] = [
     Color32::from_rgb(0x56, 0xb6, 0xc2),
     Color32::from_rgb(0xdc, 0xdf, 0xe4),
 ];
-const BRIGHT: [Color32; 8] = [
+pub const BRIGHT: [Color32; 8] = [
     Color32::from_rgb(0x7f, 0x84, 0x8e),
     Color32::from_rgb(0xf4, 0x84, 0x8c),
     Color32::from_rgb(0xb5, 0xdc, 0x96),
