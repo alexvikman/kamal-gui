@@ -382,10 +382,11 @@ pub fn date_time_short(ms: i64) -> String {
 }
 
 pub fn short_version(v: &str) -> String {
-    if v.len() >= 40 && v[..40].chars().all(|c| c.is_ascii_hexdigit()) {
-        format!("{}{}", &v[..7], &v[40..])
-    } else {
-        v.to_string()
+    // Versions are read from the servers: `get` rather than slicing, so one
+    // with multi-byte characters can't panic on a char boundary.
+    match v.get(..40) {
+        Some(sha) if sha.chars().all(|c| c.is_ascii_hexdigit()) => format!("{}{}", &sha[..7], &v[40..]),
+        _ => v.to_string(),
     }
 }
 

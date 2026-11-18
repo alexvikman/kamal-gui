@@ -1,0 +1,18 @@
+# Dependency policy, checked in CI with `cargo deny check advisories sources`.
+
+[graph]
+# What ships: the macOS app and CLI.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[advisories]
+# Known vulnerabilities and unsound code always fail. "Unmaintained" fails
+# only for crates this workspace depends on directly, where we can act on it.
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono only formats local timestamps in the UI; replace it when convenient" },
+]
+
+[sources]
+# Crates come from crates.io and nowhere else.
+unknown-registry = "deny"
+unknown-git = "deny"

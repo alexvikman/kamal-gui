@@ -45,8 +45,11 @@ pub fn login_path() -> &'static str {
         for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
             parts.push(d.into());
         }
+        // Absolute entries only: kamal runs inside a checkout of the project,
+        // where a relative entry (`.`, `bin`, `node_modules/.bin`) would let
+        // the repository supply its own `git`, `ssh` or `docker`.
         let mut seen = HashSet::new();
-        parts.retain(|p| !p.is_empty() && seen.insert(p.clone()));
+        parts.retain(|p| p.starts_with('/') && seen.insert(p.clone()));
         parts.join(":")
     })
 }

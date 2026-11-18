@@ -107,7 +107,7 @@ pub fn latest_release(source: &str) -> Option<Release> {
     {
         return r.clone();
     }
-    let repo = source.trim_end_matches('/').trim_end_matches(".git").strip_prefix("https://github.com/")?.to_string();
+    let repo = github_repo(source)?;
     let result = run(command("gh").args([
         "api",
         &format!("repos/{repo}/releases/latest"),
@@ -118,9 +118,27 @@ pub fn latest_release(source: &str) -> Option<Release> {
     .and_then(|out| {
         let mut p = out.split('\t');
         Some(Release { tag: p.next()?.to_string(), published_at: p.next()?.to_string(), url: p.next()?.to_string() })
-    });
+    })
+    // The URL is opened in the browser.
+    .filter(|r| r.url.starts_with("https://github.com/"));
     cache.lock().unwrap().insert(source.to_string(), (Instant::now(), result.clone()));
     result
+}
+
+/// `owner/repo` from a GitHub URL. The source is an image label, written by
+/// whoever built the image, and becomes part of an authenticated API path:
+/// only a plain `owner/repo` gets through (no `..`, `?`, `{…}` or extra
+/// segments that would point the request somewhere else).
+fn github_repo(source: &str) -> Option<String> {
+    let rest = source.trim_end_matches('/').trim_end_matches(".git").strip_prefix("https://github.com/")?;
+    let (owner, repo) = rest.split_once('/')?;
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            && s.chars().any(|c| c != '.')
+            && !s.starts_with('-')
+    };
+    (ok(owner) && ok(repo)).then(|| format!("{owner}/{repo}"))
 }
 
 #[cfg(test)]
@@ -143,6 +161,26 @@ mod tests {
         assert_eq!(base_image(DOCKERFILE, None).as_deref(), Some("serversideup/php:8.4-cli"));
         assert_eq!(base_image("FROM --platform=linux/amd64 ruby:3.4 AS base\n", None).as_deref(), Some("ruby:3.4"));
         assert_eq!(base_image(DOCKERFILE, Some("missing")), None);
+    }
+
+    #[test]
+    fn image_sources() {
+        assert_eq!(
+            github_repo("https://github.com/serversideup/docker-php").as_deref(),
+            Some("serversideup/docker-php")
+        );
+        assert_eq!(github_repo("https://github.com/org/app.git/").as_deref(), Some("org/app"));
+        for bad in [
+            "https://gitlab.com/org/app",
+            "https://github.com/org",
+            "https://github.com/../user",
+            "https://github.com/org/app/../../user",
+            "https://github.com/org/app?x=",
+            "https://github.com/{owner}/{repo}",
+            "https://github.com/-x/app",
+        ] {
+            assert_eq!(github_repo(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -29,6 +29,11 @@ impl SecretRef {
     pub fn parse(s: &str) -> Result<Self> {
         let rest = s.strip_prefix("op://").with_context(|| format!("not an op:// reference: {s}"))?;
         let parts: Vec<&str> = rest.split('/').collect();
+        // References come from files in cloned repos and end up as arguments
+        // to `op`; a part like `--account=…` must never be read as an option.
+        if parts.iter().any(|p| p.starts_with('-')) {
+            bail!("invalid op:// reference: {s} (names can't start with a dash)");
+        }
         match parts.as_slice() {
             [v, i, f] if ![v, i, f].iter().any(|p| p.is_empty()) => {
                 Ok(Self { vault: v.to_string(), item: i.to_string(), section: None, field: f.to_string() })
@@ -107,7 +112,7 @@ pub fn missing_files_problem(dir: &Path, secrets_path: Option<&str>, destination
     let main = &files[0];
     let example = dir.join(format!("{main}.example")).is_file();
     let ignored =
-        command("git").arg("-C").arg(dir).args(["check-ignore", "-q", main]).status().is_ok_and(|s| s.success());
+        command("git").arg("-C").arg(dir).args(["check-ignore", "-q", "--", main]).status().is_ok_and(|s| s.success());
     if !example && !ignored {
         return None;
     }
@@ -307,6 +312,14 @@ mod tests {
         assert_eq!(refs[0].item, "app");
         assert_eq!(refs[1].to_string(), "op://deploy/docker-hub/PW");
         assert!(refs[0].env_key().starts_with("KGUI_SECRET_6F703A2F2F"));
+    }
+
+    #[test]
+    fn rejects_option_like_references() {
+        assert!(SecretRef::parse("op://deploy/--account=evil/KEY").is_err());
+        assert!(SecretRef::parse("op://-v/item/KEY").is_err());
+        assert!(scan("A=$(kgui secret op://deploy/--help/KEY)\n").is_empty());
+        assert!(SecretRef::parse("op://deploy/my-app/APP-KEY").is_ok());
     }
 
     #[test]

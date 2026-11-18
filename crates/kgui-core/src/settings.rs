@@ -11,6 +11,20 @@ pub fn data_dir() -> PathBuf {
         .join("kgui")
 }
 
+/// Create the data dir if needed and keep it private to the user: run logs,
+/// deploy checkouts and the `kgui` shim that kamal runs all live in it.
+pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let mut perms = std::fs::metadata(&dir)?.permissions();
+    if perms.mode() & 0o077 != 0 {
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms)?;
+    }
+    Ok(dir)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {

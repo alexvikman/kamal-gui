@@ -145,13 +145,12 @@ fn status_cmd(args: &[String]) -> Result<()> {
                 for c in &h.containers {
                     let info = st.versions.get(&c.version);
                     let behind = info.and_then(|i| i.behind).map(|b| format!(" ({b} behind)")).unwrap_or_default();
+                    let version: String = c.version.chars().take(12).collect();
                     println!(
-                        "  {:<8} {:<40} {:<8} {}{}",
+                        "  {:<8} {:<40} {:<8} {version}{behind}",
                         c.role.as_deref().unwrap_or("-"),
                         c.name,
                         c.state,
-                        &c.version[..c.version.len().min(12)],
-                        behind
                     );
                 }
             }

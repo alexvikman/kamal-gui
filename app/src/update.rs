@@ -59,13 +59,22 @@ struct ApiAsset {
 
 fn parse_release(json: &str) -> Result<Release> {
     let r: ApiRelease = serde_json::from_str(json).context("unexpected response from GitHub")?;
+    // Downloads only ever come from this repository's releases.
+    let downloads = format!("{}/releases/download/", build_info::repo_url());
     let asset = |name: &str| {
         r.assets
             .iter()
             .find(|a| a.name == name)
             .map(|a| a.browser_download_url.clone())
             .with_context(|| format!("the nightly release has no {name}"))
+            .and_then(|url| {
+                anyhow::ensure!(url.starts_with(&downloads), "unexpected download address for {name}: {url}");
+                Ok(url)
+            })
     };
+    if r.target_commitish.len() != 40 || !r.target_commitish.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("the nightly release doesn't name the commit it was built from");
+    }
     Ok(Release {
         title: r.name.unwrap_or_else(|| "Nightly".into()),
         sha: r.target_commitish.clone(),
@@ -76,11 +85,40 @@ fn parse_release(json: &str) -> Result<Release> {
     })
 }
 
+/// A macOS system tool by absolute path, so the updater doesn't depend on
+/// what happens to come first on PATH.
+fn system(tool: &str) -> std::process::Command {
+    std::process::Command::new(format!("/usr/bin/{tool}"))
+}
+
+/// curl that only speaks HTTPS, also when following redirects.
+fn curl() -> std::process::Command {
+    let mut c = system("curl");
+    c.args(["--proto", "=https", "--proto-redir", "=https", "-fsSL"]);
+    c
+}
+
+/// `0.1.0-nightly.42` → 42 (the CI run that built it). None for dev builds.
+fn nightly_number(version: &str) -> Option<u64> {
+    version.rsplit_once("-nightly.")?.1.parse().ok()
+}
+
+/// Updates only go forward. The provenance check proves a download was built
+/// by CI from `main`, which is just as true of an old nightly: without this,
+/// whoever can replace the release's files could reinstall a build with a
+/// bug that has since been fixed.
+fn check_not_older(new: &str, installed: &str) -> Result<()> {
+    let Some(installed_n) = nightly_number(installed) else { return Ok(()) };
+    match nightly_number(new) {
+        Some(n) if n >= installed_n => Ok(()),
+        _ => bail!("the download ({new}) is older than this version ({installed}); not installing"),
+    }
+}
+
 /// The newest nightly release (public API, no login needed).
 pub fn check() -> Result<Release> {
     let url = format!("https://api.github.com/repos/{}/releases/tags/nightly", build_info::REPO);
-    let json = run(command("curl").args([
-        "-fsSL",
+    let json = run(curl().args([
         "--max-time",
         "20",
         "-H",
@@ -128,12 +166,12 @@ fn expected_digest(sums: &str, file_name: &str) -> Option<String> {
 }
 
 fn sha256(path: &Path) -> Result<String> {
-    let out = run(command("shasum").args(["-a", "256"]).arg(path))?;
+    let out = run(system("shasum").args(["-a", "256"]).arg(path))?;
     out.split_whitespace().next().map(str::to_lowercase).context("shasum printed nothing")
 }
 
 fn download(url: &str, to: &Path) -> Result<()> {
-    run(command("curl").args(["-fsSL", "--max-time", "600", "-H", "User-Agent: kamal-gui", "-o"]).arg(to).arg(url))
+    run(curl().args(["--max-time", "600", "-H", "User-Agent: kamal-gui", "-o"]).arg(to).arg(url))
         .with_context(|| format!("download failed: {url}"))?;
     Ok(())
 }
@@ -168,10 +206,14 @@ pub fn install_into(release: &Release, bundle: &Path, step: &dyn Fn(&str)) -> Re
     let parent = bundle.parent().context("app bundle has no parent folder")?;
     // Work next to the bundle so the final swap is a rename on one volume.
     let work = parent.join(format!(".kamal-gui-update-{}", std::process::id()));
-    if work.exists() {
+    if work.symlink_metadata().is_ok() {
         std::fs::remove_dir_all(&work)?;
     }
-    std::fs::create_dir_all(&work)
+    // /Applications is writable by every admin user. Create the folder
+    // ourselves (fail if something appears in its place) and keep it private,
+    // so nothing can be swapped in between verifying and installing.
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&work)
         .with_context(|| format!("can't write to {} (move the app somewhere you can write to)", parent.display()))?;
     let result = install_in(release, bundle, &work, step);
     let _ = std::fs::remove_dir_all(&work);
@@ -201,18 +243,21 @@ fn install_in(release: &Release, bundle: &Path, work: &Path, step: &dyn Fn(&str)
 
     step("Unpacking…");
     let extract = work.join("extract");
-    run(command("ditto").args(["-x", "-k"]).arg(&zip).arg(&extract))?;
+    run(system("ditto").args(["-x", "-k"]).arg(&zip).arg(&extract))?;
     let new_app = extract.join("Kamal GUI.app");
     let plist = new_app.join("Contents/Info.plist");
     let id = run(command("/usr/libexec/PlistBuddy").args(["-c", "Print :CFBundleIdentifier"]).arg(&plist))?;
     if id.trim() != BUNDLE_ID {
         bail!("unexpected bundle id {id:?} in the download");
     }
+    let version =
+        run(command("/usr/libexec/PlistBuddy").args(["-c", "Print :CFBundleShortVersionString"]).arg(&plist))?;
+    check_not_older(version.trim(), build_info::VERSION)?;
     // The app is ad-hoc signed (no Apple Developer ID to pin a Team ID to), so
     // this checks integrity and identifier; who built it is established by
     // the provenance check above.
     let requirement = format!("-R=identifier \"{BUNDLE_ID}\"");
-    run(command("codesign").args(["--verify", "--deep", "--strict", &requirement]).arg(&new_app))
+    run(system("codesign").args(["--verify", "--deep", "--strict", &requirement]).arg(&new_app))
         .context("the downloaded app's signature is invalid")?;
 
     step("Installing…");
@@ -237,14 +282,41 @@ mod tests {
 
     #[test]
     fn parses_release() {
-        let json = r#"{"name":"Nightly 2026-11-18 (1272bf9)","target_commitish":"1272bf9abc","published_at":"2026-11-18T19:20:00Z",
+        const SHA: &str = "1272bf9abc1272bf9abc1272bf9abc1272bf9abc";
+        const DL: &str = "https://github.com/alexvikman/kamal-gui/releases/download/nightly";
+        let json = |sha: &str, zip: &str| {
+            format!(
+                r#"{{"name":"Nightly 2026-11-18 (1272bf9)","target_commitish":"{sha}","published_at":"2026-11-18T19:20:00Z",
             "html_url":"https://github.com/alexvikman/kamal-gui/releases/tag/nightly",
-            "assets":[{"name":"SHA256SUMS","browser_download_url":"https://x/SHA256SUMS"},
-                      {"name":"KamalGUI-nightly-macos-universal.zip","browser_download_url":"https://x/app.zip"}]}"#;
-        let r = parse_release(json).unwrap();
+            "assets":[{{"name":"SHA256SUMS","browser_download_url":"{DL}/SHA256SUMS"}},
+                      {{"name":"KamalGUI-nightly-macos-universal.zip","browser_download_url":"{zip}"}}]}}"#
+            )
+        };
+        let zip = format!("{DL}/KamalGUI-nightly-macos-universal.zip");
+        let r = parse_release(&json(SHA, &zip)).unwrap();
         assert_eq!(r.short_sha(), "1272bf9");
-        assert_eq!(r.zip_url, "https://x/app.zip");
+        assert_eq!(r.zip_url, zip);
         assert!(parse_release(r#"{"target_commitish":"a","html_url":"u","assets":[]}"#).is_err());
+        // Downloads from anywhere else, or a release that isn't tied to a commit.
+        assert!(parse_release(&json(SHA, "https://evil.example/app.zip")).is_err());
+        assert!(
+            parse_release(&json(SHA, "http://github.com/alexvikman/kamal-gui/releases/download/nightly/a.zip"))
+                .is_err()
+        );
+        assert!(parse_release(&json("main", &zip)).is_err());
+        assert!(parse_release(&json("--flag", &zip)).is_err());
+    }
+
+    #[test]
+    fn updates_only_go_forward() {
+        assert_eq!(nightly_number("0.1.0-nightly.42"), Some(42));
+        assert_eq!(nightly_number("0.1.0-dev"), None);
+        assert!(check_not_older("0.1.0-nightly.43", "0.1.0-nightly.42").is_ok());
+        assert!(check_not_older("0.1.0-nightly.42", "0.1.0-nightly.42").is_ok());
+        assert!(check_not_older("0.1.0-nightly.41", "0.1.0-nightly.42").is_err());
+        assert!(check_not_older("0.1.0", "0.1.0-nightly.42").is_err());
+        // Development builds can install any nightly.
+        assert!(check_not_older("0.1.0-nightly.1", "0.1.0-dev").is_ok());
     }
 
     #[test]

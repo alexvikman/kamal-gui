@@ -135,9 +135,25 @@ impl Action {
 
     pub fn label(&self) -> String {
         match self {
-            Action::Rollback { version } => format!("rollback {}", &version[..version.len().min(7)]),
+            Action::Rollback { version } => format!("rollback {}", version.chars().take(7).collect::<String>()),
             _ => self.kamal_args().join(" "),
         }
+    }
+
+    /// Rollback versions are read from the servers (image tags) and accessory
+    /// names from deploy configs. Both become kamal arguments, so neither may
+    /// look like an option.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let word = |s: &str| {
+            s.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        };
+        match self {
+            Action::Rollback { version } => anyhow::ensure!(word(version), "refusing unsafe version {version:?}"),
+            Action::Accessory { name, .. } => anyhow::ensure!(word(name), "refusing unsafe accessory name {name:?}"),
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Deploys check out the requested ref. Everything else runs against the
@@ -170,6 +186,21 @@ mod tests {
         assert!(a(AccessoryVerb::Reboot).needs_secrets());
         assert!(!a(AccessoryVerb::Restart).needs_secrets());
         assert!(!a(AccessoryVerb::Boot).uses_ref());
+    }
+
+    #[test]
+    fn rejects_option_like_arguments() {
+        let rollback = |v: &str| Action::Rollback { version: v.into() };
+        assert!(rollback("0f3a9c1d2e4b5a69788796a5b4c3d2e1f0a9b8c7").check().is_ok());
+        assert!(rollback("0f3a9c1_uncommitted_ab12").check().is_ok());
+        assert!(rollback("--hosts=evil").check().is_err());
+        assert!(rollback("v1 -h evil").check().is_err());
+        assert!(rollback("").check().is_err());
+        assert_eq!(rollback("åäöåäöåäö").label(), "rollback åäöåäöå");
+        let accessory = |n: &str| Action::Accessory { name: n.into(), verb: AccessoryVerb::Boot };
+        assert!(accessory("redis").check().is_ok());
+        assert!(accessory("-y").check().is_err());
+        assert!(Action::Custom { args: vec!["app".into(), "exec".into(), "-i".into()] }.check().is_ok());
     }
 
     #[test]

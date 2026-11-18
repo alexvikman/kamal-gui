@@ -33,8 +33,33 @@ fn git_in(dir: &Path) -> Command {
     c
 }
 
+/// Transports git may use for origin. What is cloned gets deployed, so only
+/// encrypted, authenticated ones: no `http://`, `git://`, local paths or
+/// remote helpers (`ext::…` runs a command).
+const ALLOWED_PROTOCOLS: &str = "https:ssh";
+
+/// Accepts `https://…`, `ssh://…` and scp-style `user@host:path`.
+pub fn check_origin(url: &str) -> Result<()> {
+    let host_ok = |h: &str| {
+        !h.is_empty() && !h.starts_with('-') && h.chars().all(|c| c.is_ascii_alphanumeric() || "._-@[]:".contains(c))
+    };
+    let ok = !url.starts_with('-')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && match url.split_once("://") {
+            Some(("https" | "ssh", rest)) => host_ok(rest.split('/').next().unwrap_or("")),
+            Some(_) => false,
+            // scp-style: a host before the first colon, then a path.
+            None => url
+                .split_once(':')
+                .is_some_and(|(host, path)| host_ok(host) && !path.is_empty() && !path.starts_with(':')),
+        };
+    anyhow::ensure!(ok, "unsupported repository URL {url:?} (use https://… or git@host:org/repo.git)");
+    Ok(())
+}
+
 /// Create the bare clone if needed, then fetch. Returns the mirror path.
 pub fn ensure_mirror(project: &str, origin: &str) -> Result<PathBuf> {
+    check_origin(origin)?;
     crate::env::with_ssh(|| ensure_mirror_inner(project, origin))
 }
 
@@ -45,8 +70,12 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        run(command("git").args(["clone", "--bare", "--quiet", origin]).arg(&dir))
-            .with_context(|| format!("could not clone {origin}"))?;
+        // `--` ends option parsing: the URL can never be taken as a flag.
+        run(command("git")
+            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+            .args(["clone", "--bare", "--quiet", "--", origin])
+            .arg(&dir))
+        .with_context(|| format!("could not clone {origin}"))?;
         run(git(&dir).args(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]))?;
         // Never let stray secrets files make Kamal see an "uncommitted" tree.
         std::fs::create_dir_all(dir.join("info"))?;
@@ -59,7 +88,9 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
 }
 
 pub fn fetch(mirror: &Path) -> Result<()> {
-    run(git(mirror).args(["fetch", "--quiet", "--prune", "--tags", "origin"]))?;
+    run(git(mirror)
+        .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+        .args(["fetch", "--quiet", "--prune", "--tags", "origin"]))?;
     let _ = run(git(mirror).args(["remote", "set-head", "origin", "--auto"]));
     Ok(())
 }
@@ -225,4 +256,37 @@ pub fn ref_list(project: &str) -> Result<RefList> {
         worktree_head: worktree_head(project),
         default_branch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_urls() {
+        for ok in [
+            "git@github.com:org/app.git",
+            "https://github.com/org/app",
+            "ssh://git@github.com/org/app.git",
+            "ssh://git@[fd00::1]:2222/org/app.git",
+            "deploy@git.example.com:app",
+        ] {
+            assert!(check_origin(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "--upload-pack=touch /tmp/x",
+            "-oProxyCommand=x:repo",
+            "ext::sh -c 'touch /tmp/x'",
+            "ext::sh",
+            "http://github.com/org/app",
+            "git://github.com/org/app",
+            "file:///tmp/repo",
+            "/tmp/repo",
+            "ssh://-oProxyCommand=x/repo",
+            "git@github.com:org/app.git\n--flag",
+            "",
+        ] {
+            assert!(check_origin(bad).is_err(), "{bad}");
+        }
+    }
 }

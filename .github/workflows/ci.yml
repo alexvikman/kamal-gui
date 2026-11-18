@@ -61,6 +61,19 @@ jobs:
       - name: Test
         run: cargo test -p kgui-core -p kgui-cli --locked
 
+  dependencies:
+    name: Dependencies (advisories, sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Known vulnerabilities in Cargo.lock, and crates from anywhere but
+      # crates.io (see deny.toml).
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        with:
+          command: check advisories sources
+
   nightly:
     name: Nightly release
     # Only for pushes to main, and only once every check has passed.

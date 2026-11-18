@@ -220,7 +220,9 @@ pub fn build_targets(files: &[String], read: impl Fn(&str) -> Option<String>) ->
     let mut dockerfiles: HashMap<String, Option<String>> = HashMap::new();
     for unit in groups.values_mut().flatten() {
         let path = unit.config.dockerfile.clone().unwrap_or_else(|| "Dockerfile".into());
-        let text = dockerfiles.entry(path.clone()).or_insert_with(|| read(&path));
+        // The path comes from the config; only ever read inside the repository.
+        let inside = Path::new(&path).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        let text = dockerfiles.entry(path.clone()).or_insert_with(|| if inside { read(&path) } else { None });
         unit.base_image =
             text.as_deref().and_then(|t| crate::images::base_image(t, unit.config.build_target.as_deref()));
     }
@@ -283,6 +285,18 @@ mod tests {
         assert_eq!(name_from_url("https://github.com/org/app/").as_deref(), Some("app"));
         assert_eq!(name_from_url("https://github.com/org/app.git").as_deref(), Some("app"));
         assert_eq!(name_from_url("../x/.."), None);
+    }
+
+    #[test]
+    fn dockerfile_outside_the_repo_is_not_read() {
+        for path in ["/etc/hosts", "../../secret/Dockerfile"] {
+            let config = format!("{FULL}  dockerfile: {path}\n");
+            let (t, _) = build_targets(&["deploy.yml".to_string()], |p| match p {
+                "config/deploy.yml" => Some(config.clone()),
+                other => panic!("read {other}"),
+            });
+            assert_eq!(t[0].units[0].base_image, None);
+        }
     }
 
     #[test]

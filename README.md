@@ -52,12 +52,14 @@ build provenance with `gh attestation verify` (built by this repo's `ci.yml` on
 `main`, at the release's commit, on a GitHub-hosted runner). If that can't be
 verified, for instance because `gh` isn't signed in, nothing is installed. It then
 checks the bundle id and signature, swaps the app in place and relaunches.
+It never installs a build older than the one that's running.
 Updating is disabled while a deploy is running.
 
 ## How it works
 
 - **Projects are added to the app**, either by picking repositories from GitHub
-  (through `gh`, with Kamal repos detected via code search) or by pasting a git URL.
+  (through `gh`, with Kamal repos detected via code search) or by pasting a git URL
+  (`https://…` or ssh, e.g. `git@github.com:org/app.git`).
   The app keeps its own bare clone of each one in
   `~/Library/Application Support/kgui/repos/`. Your working copies are never read or touched.
 - **Deploys run from a dedicated worktree** (`…/kgui/worktrees/<project>`) checked out at
@@ -72,7 +74,8 @@ Updating is disabled while a deploy is running.
   default branch it is, and which older versions you can roll back to.
 - **Logs** stream with `docker logs --follow` over ssh into a filterable console.
 - **History**: every run is stored with its commit, outcome and full output
-  (`…/kgui/history.sqlite`, `…/kgui/logs/<id>.log`).
+  (`…/kgui/history.sqlite`, `…/kgui/logs/<id>.log`). Secret values the app fetched for
+  the run are replaced with `[REDACTED]` in the output, should a command print one.
 
 ## Secrets
 

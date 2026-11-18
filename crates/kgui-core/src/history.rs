@@ -38,7 +38,7 @@ pub struct History {
 
 impl History {
     pub fn open() -> Result<Self> {
-        let dir = data_dir();
+        let dir = crate::settings::ensure_data_dir()?;
         std::fs::create_dir_all(dir.join("logs"))?;
         let conn = Connection::open(dir.join("history.sqlite"))?;
         conn.execute_batch(

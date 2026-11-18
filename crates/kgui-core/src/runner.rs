@@ -136,6 +136,7 @@ impl Runner {
         git_ref: Option<String>,
     ) -> anyhow::Result<Run> {
         anyhow::ensure!(!unit_ids.is_empty(), "no units selected");
+        action.check()?;
         let history = History::open()?;
         let run_id = history.start(project, &unit_ids.join(", "), &action.label())?;
         let run = history.get(run_id)?.context("run disappeared")?;
@@ -223,16 +224,42 @@ struct Output {
     runner: Runner,
     key: String,
     file: Mutex<Option<File>>,
+    /// Secret values to mask in everything emitted, longest first.
+    masked: Mutex<Vec<String>>,
 }
+
+const MASK: &str = "[REDACTED]";
+/// Shorter values (`true`, a port number) would mask ordinary output.
+const MIN_MASKED_LEN: usize = 8;
 
 impl Output {
     fn new(runner: Runner, key: String, log_file: Option<std::path::PathBuf>) -> Arc<Self> {
-        let file = log_file.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
-        Arc::new(Self { runner, key, file: Mutex::new(file) })
+        use std::os::unix::fs::OpenOptionsExt;
+        let file =
+            log_file.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p).ok());
+        Arc::new(Self { runner, key, file: Mutex::new(file), masked: Mutex::default() })
+    }
+
+    /// Never show these values, in the console or the stored log, should a
+    /// command, hook or error message print them. Output is handled line by
+    /// line, so a multi-line value (a private key) is masked per line.
+    fn mask<'a>(&self, values: impl IntoIterator<Item = &'a str>) {
+        let mut masked = self.masked.lock().unwrap();
+        for line in values.into_iter().flat_map(str::lines).map(str::trim) {
+            if line.len() >= MIN_MASKED_LEN && !masked.iter().any(|m| m == line) {
+                masked.push(line.to_string());
+            }
+        }
+        masked.sort_by_key(|m| std::cmp::Reverse(m.len()));
     }
 
     fn emit(&self, stream: Stream, line: impl Into<String>) {
-        let line = line.into();
+        let mut line = line.into();
+        for secret in self.masked.lock().unwrap().iter() {
+            if line.contains(secret.as_str()) {
+                line = line.replace(secret.as_str(), MASK);
+            }
+        }
         if let Some(f) = self.file.lock().unwrap().as_mut() {
             let tag = match stream {
                 Stream::Out => 'O',
@@ -260,8 +287,9 @@ pub fn read_log(id: i64) -> anyhow::Result<Vec<(Stream, String)>> {
         .lines()
         .map_while(Result::ok)
         .map(|l| {
-            let (tag, rest) = l.split_at(l.len().min(2));
-            let stream = match tag.trim() {
+            // Not `split_at`: a damaged file must not panic on a char boundary.
+            let (tag, rest) = l.split_once(' ').filter(|(tag, _)| matches!(*tag, "O" | "E" | "I")).unwrap_or(("I", &l));
+            let stream = match tag {
                 "O" => Stream::Out,
                 "E" => Stream::Err,
                 _ => Stream::Info,
@@ -351,7 +379,9 @@ fn execute(
         if !refs.is_empty() {
             let items: BTreeSet<_> = refs.iter().map(|r| (&r.vault, &r.item)).collect();
             out.info(format!("› Reading {} secrets ({} items) from 1Password…", refs.len(), items.len()));
-            envs.extend(secrets::resolve_all(&settings.op_account, &refs)?);
+            let resolved = secrets::resolve_all(&settings.op_account, &refs)?;
+            out.mask(resolved.iter().map(|(_, value)| value.as_str()));
+            envs.extend(resolved);
         } else if secrets::uses_legacy_adapter(&wt) {
             out.info("› .kamal/secrets uses op-read-item-field (one op call per field). `kgui migrate-secrets` converts it to kgui secret.");
         }
@@ -470,6 +500,28 @@ mod tests {
         let (lines, _) = collect(&rx, &key);
         assert!(lines.contains(&(Stream::Out, "one".into())));
         assert!(lines.contains(&(Stream::Err, "two".into())));
+    }
+
+    #[test]
+    fn masks_secret_values_in_output() {
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::new(tx, Arc::new(|| {}));
+        let key = "t:3".to_string();
+        let out = Output::new(runner.clone(), key.clone(), None);
+        out.mask(["s3cr3t-registry-token", "-----BEGIN KEY-----\nAAAABBBBCCCCDDDD\n-----END KEY-----", "true", ""]);
+        out.emit(Stream::Out, "docker login -p s3cr3t-registry-token registry");
+        out.emit(Stream::Err, "key: AAAABBBBCCCCDDDD");
+        out.emit(Stream::Out, "healthy: true");
+        runner.send(Event::End { key: key.clone(), status: Status::Ok });
+        let (lines, _) = collect(&rx, &key);
+        assert_eq!(
+            lines,
+            [
+                (Stream::Out, "docker login -p [REDACTED] registry".to_string()),
+                (Stream::Err, "key: [REDACTED]".to_string()),
+                (Stream::Out, "healthy: true".to_string()),
+            ]
+        );
     }
 
     #[test]
