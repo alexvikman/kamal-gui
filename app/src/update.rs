@@ -89,7 +89,16 @@ pub fn check() -> Result<Release> {
         "User-Agent: kamal-gui",
         &url,
     ]))
-    .context("could not reach GitHub")?;
+    .map_err(|e| {
+        let msg = format!("{e:#}");
+        if msg.contains("404") {
+            anyhow::anyhow!("no nightly release has been published yet")
+        } else if msg.contains("Could not resolve host") || msg.contains("timed out") {
+            anyhow::anyhow!("GitHub can't be reached right now (offline?)")
+        } else {
+            e.context("could not reach GitHub")
+        }
+    })?;
     parse_release(&json)
 }
 

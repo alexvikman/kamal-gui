@@ -3,7 +3,6 @@ use crate::task::{self, Task};
 use crate::theme;
 use egui::{Id, Key, Modal, RichText, ScrollArea, Ui};
 use kgui_core::github::{self, Repo};
-use kgui_core::kamal;
 use kgui_core::project::{self, Project};
 use kgui_core::settings::Settings;
 use std::collections::BTreeSet;
@@ -157,71 +156,6 @@ pub fn split_args(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
-}
-
-// ── Settings ────────────────────────────────────────────────────────────
-
-pub struct SettingsDialog {
-    settings: Settings,
-    kamal_path: String,
-    detected: String,
-    error: Option<String>,
-}
-
-impl SettingsDialog {
-    pub fn new() -> Self {
-        let settings = Settings::load();
-        let detected = kamal::binary(&Settings { kamal_path: None, ..settings.clone() }).display().to_string();
-        Self {
-            kamal_path: settings.kamal_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            settings,
-            detected,
-            error: None,
-        }
-    }
-
-    /// Returns true when the dialog should close.
-    pub fn ui(&mut self, ctx: &egui::Context) -> bool {
-        let mut close = false;
-        let resp = Modal::new(Id::unique("settings")).show(ctx, |ui| {
-            ui.set_width(540.0);
-            let p = theme::palette(ui);
-            ui.label(theme::title("Settings", 15.0));
-            ui.add_space(4.0);
-            ui.label(RichText::new("1Password account").family(theme::medium()));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.settings.op_account)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label(RichText::new("Used for op:// references in .kamal/secrets.").size(12.0).color(p.muted));
-            ui.add_space(6.0);
-            ui.label(RichText::new("Path to kamal").family(theme::medium()));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.kamal_path)
-                    .hint_text(format!("Auto-detected: {}", self.detected))
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY),
-            );
-            if let Some(e) = &self.error {
-                ui.colored_label(p.bad, e);
-            }
-            buttons(ui, |ui| {
-                if ui.add(theme::primary("Save")).clicked() {
-                    let path = self.kamal_path.trim();
-                    self.settings.kamal_path = (!path.is_empty()).then(|| path.into());
-                    match self.settings.save() {
-                        Ok(()) => close = true,
-                        Err(e) => self.error = Some(format!("{e:#}")),
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-            });
-        });
-        close || resp.should_close()
-    }
 }
 
 // ── Add projects ────────────────────────────────────────────────────────

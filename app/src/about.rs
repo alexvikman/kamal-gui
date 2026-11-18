@@ -1,19 +1,12 @@
-//! About window: version, build and updates.
+//! The About tab of the Settings page: version, build and updates.
 
 use crate::build_info;
 use crate::task::{self, Task};
 use crate::theme;
 use crate::update::{self, Release};
-use egui::{Id, Modal, RichText, Ui};
+use egui::{RichText, Ui};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-pub enum AboutResult {
-    Open,
-    Close,
-    /// The update is installed; relaunch from this bundle.
-    Relaunch(PathBuf),
-}
 
 pub struct About {
     icon: Option<egui::TextureHandle>,
@@ -25,7 +18,7 @@ pub struct About {
 }
 
 impl About {
-    /// Opens the window and checks for a newer nightly right away.
+    /// Checks for a newer nightly right away.
     pub fn new(ctx: &egui::Context, known: Option<Release>) -> Self {
         let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok().map(|icon| {
             let image =
@@ -42,76 +35,74 @@ impl About {
         self.check = Some(Task::spawn(ctx, update::check));
     }
 
-    /// The newest release seen by this window (for the app's own notice).
+    /// The newest release seen here (for the sidebar's update notice).
     pub fn latest(&self) -> Option<&Release> {
         self.release.as_ref()
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, runs_active: bool) -> AboutResult {
+    /// Returns the app bundle to relaunch once an update is installed.
+    pub fn ui(&mut self, ui: &mut Ui, runs_active: bool) -> Option<PathBuf> {
         match task::poll(&mut self.check) {
             Some(Ok(r)) => self.release = Some(r),
             Some(Err(e)) => self.error = Some(format!("Couldn't check for updates: {e}")),
             None => {}
         }
         match task::poll(&mut self.install) {
-            Some(Ok(bundle)) => return AboutResult::Relaunch(bundle),
+            Some(Ok(bundle)) => return Some(bundle),
             Some(Err(e)) => self.error = Some(format!("Update failed: {e}")),
             None => {}
         }
 
-        let mut close = false;
-        let busy = self.install.is_some();
-        let resp = Modal::new(Id::unique("about")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            let p = theme::palette(ui);
-            ui.horizontal(|ui| {
-                if let Some(icon) = &self.icon {
-                    ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(64.0, 64.0)));
-                }
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.label(theme::title("Kamal GUI", 20.0));
-                    ui.label(theme::caption(format!("Version {}", build_info::VERSION)));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(theme::caption("Build"));
-                        let commit = format!("{}/commit/{}", build_info::repo_url(), build_info::SHA);
-                        ui.hyperlink_to(
-                            RichText::new(build_info::short_sha()).monospace().size(12.0).color(theme::ACCENT),
-                            commit,
-                        );
-                        ui.label(theme::caption(format!("· {}", build_info::DATE)));
-                    });
-                    ui.label(theme::caption("Deploy, watch and debug Kamal projects."));
-                });
-            });
-
+        let p = theme::palette(ui);
+        ui.horizontal(|ui| {
+            if let Some(icon) = &self.icon {
+                ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+            }
             ui.add_space(8.0);
-            ui.separator();
-            ui.label(RichText::new("Updates").family(theme::medium()));
-            self.updates(ui, &p, runs_active);
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.hyperlink_to(RichText::new("GitHub").color(theme::ACCENT), build_info::repo_url());
-                ui.label(theme::caption("·"));
-                ui.hyperlink_to(
-                    RichText::new("Releases").color(theme::ACCENT),
-                    format!("{}/releases", build_info::repo_url()),
-                );
-                ui.label(theme::caption("·"));
-                ui.hyperlink_to(
-                    RichText::new("MIT License").color(theme::ACCENT),
-                    format!("{}/blob/main/LICENSE", build_info::repo_url()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Close")).clicked() {
-                        close = true;
-                    }
+            ui.vertical(|ui| {
+                ui.label(theme::title("Kamal GUI", 20.0));
+                ui.label(theme::caption(format!("Version {}", build_info::VERSION)));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(theme::caption("Build"));
+                    let commit = format!("{}/commit/{}", build_info::repo_url(), build_info::SHA);
+                    ui.hyperlink_to(
+                        RichText::new(build_info::short_sha()).monospace().size(12.0).color(theme::ACCENT),
+                        commit,
+                    );
+                    ui.label(theme::caption(format!("· {}", build_info::DATE)));
                 });
+                ui.label(theme::caption("Deploy, watch and debug Kamal projects."));
             });
         });
-        if close || (resp.should_close() && !busy) { AboutResult::Close } else { AboutResult::Open }
+
+        ui.add_space(20.0);
+        ui.label(theme::title("Updates", 15.0));
+        ui.add_space(4.0);
+        theme::card(ui, |ui| self.updates(ui, &p, runs_active));
+
+        ui.add_space(20.0);
+        ui.label(theme::title("Links", 15.0));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.hyperlink_to(RichText::new("GitHub").color(theme::ACCENT), build_info::repo_url());
+            ui.label(theme::caption("·"));
+            ui.hyperlink_to(
+                RichText::new("Releases").color(theme::ACCENT),
+                format!("{}/releases", build_info::repo_url()),
+            );
+            ui.label(theme::caption("·"));
+            ui.hyperlink_to(
+                RichText::new("MIT License").color(theme::ACCENT),
+                format!("{}/blob/main/LICENSE", build_info::repo_url()),
+            );
+            ui.label(theme::caption("·"));
+            ui.hyperlink_to(
+                RichText::new("Kamal documentation").color(theme::ACCENT),
+                "https://kamal-deploy.org/docs/",
+            );
+        });
+        None
     }
 
     fn updates(&mut self, ui: &mut Ui, p: &theme::Palette, runs_active: bool) {

@@ -1,7 +1,8 @@
 use crate::console::{Console, Kind, Session};
-use crate::dialogs::{self, AddDialog, SettingsDialog};
+use crate::dialogs::{self, AddDialog};
 use crate::history_view::HistoryView;
 use crate::project_view::ProjectView;
+use crate::settings_page::{PageResult, SettingsPage, SettingsTab};
 use crate::theme;
 use egui::{RichText, ScrollArea, Ui};
 use kgui_core::config::SshTarget;
@@ -63,7 +64,8 @@ pub struct KamalApp {
     console: Console,
     confirm: Option<Confirm>,
     prompt: Option<Prompt>,
-    settings: Option<SettingsDialog>,
+    /// The Settings page, when it replaces the main area.
+    settings: Option<SettingsPage>,
     add: Option<AddDialog>,
     error: Option<String>,
     /// Asking whether to quit while runs are in progress.
@@ -71,7 +73,6 @@ pub struct KamalApp {
     /// The user chose to stop the runs and quit; close once they've ended.
     quitting: bool,
     menu: crate::menu::AppMenu,
-    about: Option<crate::about::About>,
     /// Background check for a newer nightly (on start and every few hours).
     update_check: Option<crate::task::Task<crate::update::Release>>,
     last_update_check: Option<std::time::Instant>,
@@ -98,12 +99,17 @@ impl KamalApp {
             console: Console::default(),
             confirm: None,
             prompt: None,
-            settings: None,
+            // `--settings` / `--about` open straight on that page
+            // (e.g. `open -a "Kamal GUI" --args --about`).
+            settings: std::env::args().find_map(|a| match a.as_str() {
+                "--settings" => Some(SettingsPage::new(SettingsTab::General)),
+                "--about" => Some(SettingsPage::new(SettingsTab::About)),
+                _ => None,
+            }),
             add: None,
             error: None,
             quit_dialog: false,
             menu: crate::menu::install(&cc.egui_ctx),
-            about: None,
             update_check: None,
             last_update_check: None,
             update_available: None,
@@ -111,7 +117,16 @@ impl KamalApp {
         }
     }
 
+    fn open_settings(&mut self, tab: SettingsTab) {
+        match &mut self.settings {
+            Some(page) => page.tab = tab,
+            None => self.settings = Some(SettingsPage::new(tab)),
+        }
+    }
+
     fn select(&mut self, ctx: &egui::Context, name: Option<String>) {
+        // Picking a project or "All runs" leaves the Settings page.
+        self.settings = None;
         if self.current == name {
             return;
         }
@@ -143,7 +158,7 @@ impl KamalApp {
         ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search projects…").desired_width(f32::INFINITY));
         ui.add_space(2.0);
         let all = ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-            ui.selectable_label(self.current.is_none(), "All runs").clicked()
+            ui.selectable_label(self.settings.is_none() && self.current.is_none(), "All runs").clicked()
         });
         if all.inner {
             self.select(&ctx, None);
@@ -158,7 +173,7 @@ impl KamalApp {
         ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]).show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                 for proj in self.projects.iter().filter(|p| p.name.to_lowercase().contains(&q)) {
-                    let selected = self.current.as_deref() == Some(proj.name.as_str());
+                    let selected = self.settings.is_none() && self.current.as_deref() == Some(proj.name.as_str());
                     let busy = running.contains(&proj.name);
                     let r = ui.selectable_label(selected, &proj.name);
                     if busy {
@@ -187,7 +202,7 @@ impl KamalApp {
                 if let Some(r) = self.update_available.clone().filter(|r| r.is_newer()) {
                     let label = RichText::new("Update available").color(theme::ACCENT);
                     if theme::quiet_rich(ui, label).on_hover_text(format!("{} is out", r.title)).clicked() {
-                        self.about = Some(crate::about::About::new(&ctx, Some(r)));
+                        self.open_settings(SettingsTab::About);
                     }
                 }
             });
@@ -196,8 +211,9 @@ impl KamalApp {
                     self.add = Some(AddDialog::new(&ctx));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::quiet_rich(ui, RichText::new("Settings").color(p.muted)).clicked() {
-                        self.settings = Some(SettingsDialog::new());
+                    let color = if self.settings.is_some() { theme::TEXT } else { p.muted };
+                    if theme::quiet_rich(ui, RichText::new("Settings").color(color)).clicked() {
+                        self.open_settings(SettingsTab::General);
                     }
                 });
             });
@@ -211,6 +227,20 @@ impl KamalApp {
             && theme::dismissable(ui, p.bad, p.bad_soft, &e)
         {
             self.error = None;
+        }
+        if let Some(page) = &mut self.settings {
+            let runs_active = !self.console.running_projects().is_empty();
+            let result = page.ui(ui, self.update_available.clone(), runs_active);
+            if let Some(r) = page.latest_release() {
+                self.update_available = Some(r.clone());
+            }
+            if let PageResult::Relaunch(bundle) = result {
+                match crate::update::relaunch(&bundle) {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.error = Some(format!("Update installed, but {e:#}. Restart the app manually.")),
+                }
+            }
+            return;
         }
         if let Some(view) = self.current.as_ref().and_then(|n| self.views.get_mut(n)) {
             let running = self.console.running_in(&view.name).map(|s| crate::project_view::RunningRun {
@@ -337,10 +367,8 @@ impl KamalApp {
         let mut quit = false;
         while let Ok(action) = self.menu.actions.try_recv() {
             match action {
-                MenuAction::About | MenuAction::CheckForUpdates => {
-                    self.about = Some(crate::about::About::new(ctx, self.update_available.clone()));
-                }
-                MenuAction::Settings => self.settings = Some(SettingsDialog::new()),
+                MenuAction::About | MenuAction::CheckForUpdates => self.open_settings(SettingsTab::About),
+                MenuAction::Settings => self.open_settings(SettingsTab::General),
                 MenuAction::AddProject => self.add = Some(AddDialog::new(ctx)),
                 MenuAction::CloseWindow | MenuAction::Quit => quit = true,
                 MenuAction::OpenGithub => ctx.open_url(egui::OpenUrl::new_tab(crate::build_info::repo_url())),
@@ -365,24 +393,6 @@ impl KamalApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if let Some(about) = &mut self.about {
-            let runs_active = !self.console.running_projects().is_empty();
-            match about.ui(ctx, runs_active) {
-                crate::about::AboutResult::Open => {
-                    if let Some(r) = about.latest() {
-                        self.update_available = Some(r.clone());
-                    }
-                }
-                crate::about::AboutResult::Close => self.about = None,
-                crate::about::AboutResult::Relaunch(bundle) => match crate::update::relaunch(&bundle) {
-                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                    Err(e) => {
-                        self.error = Some(format!("Update installed, but {e:#}. Restart the app manually."));
-                        self.about = None;
-                    }
-                },
-            }
-        }
         if self.quit_dialog || self.quitting {
             let runs: Vec<String> = self
                 .console
@@ -433,11 +443,6 @@ impl KamalApp {
                     );
                 }
             }
-        }
-        if let Some(s) = &mut self.settings
-            && s.ui(ctx)
-        {
-            self.settings = None;
         }
         if let Some(a) = &mut self.add
             && let Some(added) = a.ui(ctx, &self.projects)

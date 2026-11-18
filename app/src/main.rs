@@ -7,6 +7,7 @@ mod dialogs;
 mod history_view;
 mod menu;
 mod project_view;
+mod settings_page;
 mod task;
 mod theme;
 mod update;
