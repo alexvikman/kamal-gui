@@ -129,6 +129,23 @@ fn download(url: &str, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The signed provenance must show that `artifact` was built by this repo's
+/// CI workflow, from `main`, at `commit`, on a GitHub-hosted runner.
+fn verify_provenance(artifact: &Path, commit: &str) -> Result<()> {
+    run(command("gh").args(["auth", "status"])).context(
+        "updates need the GitHub CLI signed in (`gh auth login`) to verify where the build came from. \
+         You can also download the app from the releases page",
+    )?;
+    let workflow = format!("{}/.github/workflows/ci.yml", build_info::REPO);
+    run(command("gh")
+        .args(["attestation", "verify"])
+        .arg(artifact)
+        .args(["--repo", build_info::REPO, "--signer-workflow", &workflow])
+        .args(["--source-ref", "refs/heads/main", "--source-digest", commit, "--deny-self-hosted-runners"]))
+    .context("build provenance could not be verified; not installing")?;
+    Ok(())
+}
+
 /// Download, verify and install `release` over the running app bundle.
 /// `step` is told what's happening. Returns the bundle path to relaunch.
 pub fn install(release: &Release, step: &dyn Fn(&str)) -> Result<PathBuf> {
@@ -168,13 +185,10 @@ fn install_in(release: &Release, bundle: &Path, work: &Path, step: &dyn Fn(&str)
         bail!("checksum mismatch for {ZIP_ASSET}: expected {expected}, got {actual}");
     }
 
-    // The checksum only proves the download matches the release. The signed
-    // provenance proves the release was built by this repo's CI.
-    if run(command("gh").args(["auth", "status"])).is_ok() {
-        step("Verifying build provenance…");
-        run(command("gh").args(["attestation", "verify"]).arg(&zip).args(["-R", build_info::REPO]))
-            .context("build provenance could not be verified")?;
-    }
+    // The checksum only proves the download matches the release. Authenticity
+    // comes from the signed build provenance, which is mandatory (fail closed).
+    step("Verifying build provenance…");
+    verify_provenance(&zip, &release.sha)?;
 
     step("Unpacking…");
     let extract = work.join("extract");
@@ -185,7 +199,11 @@ fn install_in(release: &Release, bundle: &Path, work: &Path, step: &dyn Fn(&str)
     if id.trim() != BUNDLE_ID {
         bail!("unexpected bundle id {id:?} in the download");
     }
-    run(command("codesign").args(["--verify", "--deep", "--strict"]).arg(&new_app))
+    // The app is ad-hoc signed (no Apple Developer ID to pin a Team ID to), so
+    // this checks integrity and identifier; who built it is established by
+    // the provenance check above.
+    let requirement = format!("-R=identifier \"{BUNDLE_ID}\"");
+    run(command("codesign").args(["--verify", "--deep", "--strict", &requirement]).arg(&new_app))
         .context("the downloaded app's signature is invalid")?;
 
     step("Installing…");

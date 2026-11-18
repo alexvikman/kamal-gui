@@ -47,9 +47,12 @@ Each artifact has signed build provenance:
 The app checks for a newer nightly at start and every six hours ("Update
 available" in the sidebar). **Kamal GUI → About Kamal GUI** (or **Check for
 Updates…**) shows the version and commit you're on and installs the update:
-it downloads the release, checks the SHA-256 checksum and, when `gh` is signed
-in, the signed build provenance, verifies the bundle id and signature, swaps the
-app in place and relaunches. Updating is disabled while a deploy is running.
+it downloads the release, checks the SHA-256 checksum, then verifies the signed
+build provenance with `gh attestation verify` (built by this repo's `ci.yml` on
+`main`, at the release's commit, on a GitHub-hosted runner). If that can't be
+verified, for instance because `gh` isn't signed in, nothing is installed. It then
+checks the bundle id and signature, swaps the app in place and relaunches.
+Updating is disabled while a deploy is running.
 
 ## How it works
 

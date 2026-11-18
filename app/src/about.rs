@@ -178,7 +178,7 @@ impl About {
             }));
         }
         ui.label(theme::caption(
-            "Downloads the nightly, checks its checksum and signed build provenance, replaces this app and restarts it.",
+            "Downloads the nightly, verifies its checksum and that it was built by this repo's CI (needs `gh` signed in), replaces this app and restarts it.",
         ));
     }
 }
