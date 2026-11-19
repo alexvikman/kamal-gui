@@ -55,8 +55,9 @@ pub fn login_path() -> &'static str {
 }
 
 /// Ask the login shell for its PATH (interactive, so `.zshrc` additions such
-/// as `mise activate` are included). Gives up after a few seconds.
-fn shell_path() -> Option<String> {
+/// as `mise activate` are included). Gives up after a few seconds. This is
+/// where a command typed in a terminal is looked up; `login_path` adds more.
+pub fn shell_path() -> Option<String> {
     const MARK: &str = "__KGUI_PATH__";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let script = format!("printf '\\n{MARK}%s{MARK}\\n' \"$PATH\"");

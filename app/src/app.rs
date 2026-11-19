@@ -39,6 +39,11 @@ pub enum Intent {
     },
     Cancel(String),
     RemoveProject(String),
+    /// Link `kgui` in `~/.local/bin` to the app. `replace` when the user has
+    /// agreed to give up what is there.
+    InstallCli {
+        replace: bool,
+    },
 }
 
 pub struct Confirm {
@@ -316,7 +321,7 @@ impl KamalApp {
         }
         if let Some(page) = &mut self.settings {
             let runs_active = !self.console.running_projects().is_empty();
-            let result = page.ui(ui, self.update_available.clone(), runs_active);
+            let result = page.ui(ui, requests, self.update_available.clone(), runs_active);
             if let Some(r) = page.latest_release() {
                 self.update_available = Some(r.clone());
             }
@@ -412,6 +417,13 @@ impl KamalApp {
                 self.reload_projects();
                 self.select(ctx, None);
             }),
+            Intent::InstallCli { replace } => {
+                let result = kgui_core::link::install(replace);
+                if let Some(page) = &mut self.settings {
+                    page.recheck_cli();
+                }
+                result
+            }
         };
         if let Err(e) = result {
             self.error = Some(format!("{e:#}"));
@@ -459,7 +471,7 @@ impl KamalApp {
                 MenuAction::Settings => self.open_settings(SettingsTab::General),
                 MenuAction::AddProject => self.add = Some(AddDialog::new(ctx)),
                 MenuAction::CloseWindow | MenuAction::Quit => quit = true,
-                MenuAction::OpenGithub => ctx.open_url(egui::OpenUrl::new_tab(crate::build_info::repo_url())),
+                MenuAction::OpenGithub => ctx.open_url(egui::OpenUrl::new_tab(kgui_core::build_info::repo_url())),
                 MenuAction::OpenKamalDocs => ctx.open_url(egui::OpenUrl::new_tab("https://kamal-deploy.org/docs/")),
             }
         }

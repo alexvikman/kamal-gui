@@ -98,7 +98,7 @@ jobs:
       group: nightly
       cancel-in-progress: true
     env:
-      # Baked into the binary (About window, update checks) and the bundle.
+      # Baked into the binaries (About window, update checks, `kgui --version`) and the bundle.
       KGUI_VERSION: 0.1.0-nightly.${{ github.run_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,7 +159,10 @@ jobs:
           xattr -dr com.apple.quarantine "/Applications/Kamal GUI.app"
           \`\`\`
 
-          **kgui CLI**: \`tar -xzf kgui-nightly-macos-universal.tar.gz && mv kgui ~/.local/bin/\`
+          **kgui CLI**: with the app, choose **Install command line tool** under Settings → Tools.
+          It links \`~/.local/bin/kgui\` to the app, so the command is updated with the app.
+          On a machine without the app, install the CLI on its own (a separate copy, which you update yourself):
+          \`tar -xzf kgui-nightly-macos-universal.tar.gz && mv kgui ~/.local/bin/\`
 
           Verify a download: \`gh attestation verify <file> -R ${GITHUB_REPOSITORY}\` and \`shasum -a 256 -c SHA256SUMS\`.
           NOTES

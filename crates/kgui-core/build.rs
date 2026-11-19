@@ -1,4 +1,5 @@
-//! Bakes version, commit and build date into the binary (see `build_info.rs`).
+//! Bakes version, commit and build date into the app and the `kgui` CLI (see
+//! `src/build_info.rs`).
 //!
 //! CI sets `KGUI_VERSION` (e.g. `0.1.0-nightly.42`) and `GITHUB_SHA`; local
 //! builds fall back to `<crate version>-dev` and `git rev-parse HEAD`.
@@ -11,7 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
     // Pick up new commits in local builds.
-    for path in ["../.git/HEAD", "../.git/refs/heads"] {
+    for path in ["../../.git/HEAD", "../../.git/refs/heads"] {
         if std::path::Path::new(path).exists() {
             println!("cargo:rerun-if-changed={path}");
         }

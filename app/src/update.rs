@@ -5,8 +5,8 @@
 //! (when `gh` is available) the signed build provenance, check the bundle id
 //! and signature, then swap the app bundle in place. The caller relaunches.
 
-use crate::build_info;
 use anyhow::{Context, Result, bail};
+use kgui_core::build_info;
 use kgui_core::env::{command, run};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};

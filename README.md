@@ -37,7 +37,8 @@ Every push to `main` that passes CI publishes a
 - `KamalGUI-nightly-macos-universal.zip`: unzip, move `Kamal GUI.app` to
   `/Applications`. It isn't notarized, so clear the quarantine flag once:
   `xattr -dr com.apple.quarantine "/Applications/Kamal GUI.app"`
-- `kgui-nightly-macos-universal.tar.gz`: the `kgui` CLI
+- `kgui-nightly-macos-universal.tar.gz`: the `kgui` CLI on its own, for a machine without the app.
+  With the app you don't need it: the app is also the `kgui` command (see [Command line](#command-line)).
 
 Each artifact has signed build provenance:
 `gh attestation verify <file> -R alexvikman/kamal-gui`.
@@ -54,6 +55,9 @@ verified, for instance because `gh` isn't signed in, nothing is installed. It th
 checks the bundle id and signature, swaps the app in place and relaunches.
 It never installs a build older than the one that's running.
 Updating is disabled while a deploy is running.
+
+The `kgui` command in your terminal is updated along with the app when it is the app's link
+(see [Command line](#command-line)).
 
 ## How it works
 
@@ -123,9 +127,15 @@ assigned in the same file. Files using `kamal secrets fetch` are left alone; the
 
 ## Command line
 
-```bash
-cargo install --path crates/kgui-cli
-```
+The app is also the `kgui` command. **Settings → Tools → Install command line tool** puts a link
+at `~/.local/bin/kgui` that leads to the app, so the command is updated with the app and follows
+it when it is moved; there is nothing to install again. `~/.local/bin` has to be on your PATH.
+
+Settings shows which `kgui` your terminal runs: the app, or a separate copy that the app's updates
+don't reach (`~/.cargo/bin/kgui`, say) and that falls behind. A copy at `~/.local/bin/kgui` is only
+replaced after you confirm, and nothing outside `~/.local/bin` is touched: a copy that comes earlier
+on PATH is pointed out for you to remove. `kgui --version` prints the version and commit, and
+`kgui doctor` the binary that is running, so a copy left behind is easy to spot.
 
 ```
 kgui projects                          # projects and their deploy targets
@@ -136,12 +146,23 @@ kgui branch PROJECT [BRANCH|--default] # show or set the branch a project follow
 kgui status PROJECT                    # containers per host
 kgui secret op://VAULT/ITEM/FIELD      # for .kamal/secrets
 kgui migrate-secrets [--write] FILE…
-kgui doctor                            # which kamal, op, gh, git and ssh are used
+kgui doctor                            # which kgui, kamal, op, gh, git and ssh are used
+kgui --version                         # version and commit of this kgui
 ```
 
-The app binary doubles as `kgui`: the app symlinks itself into `…/kgui/bin/` and puts that
-first on PATH for kamal processes, so `.kamal/secrets` works without installing the CLI.
+At every start the app links itself into `…/kgui/bin/` and puts that first on PATH for kamal
+processes, so `.kamal/secrets` always uses the app's own `kgui`, with or without the link in your
+terminal. Started as `kgui`, the app never opens its window: an unknown command prints the usage.
 Cancelling a run stops kamal's whole process group, including the ssh and docker processes it started.
+
+On a machine without the app, install the CLI on its own: unpack
+`kgui-nightly-macos-universal.tar.gz` from the nightly release into a folder on PATH, or build it:
+
+```bash
+cargo install --path crates/kgui-cli
+```
+
+That is a separate copy, which you update yourself.
 
 ## Requirements
 

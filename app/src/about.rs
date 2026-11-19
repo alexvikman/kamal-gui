@@ -1,10 +1,10 @@
 //! The About tab of the Settings page: version, build and updates.
 
-use crate::build_info;
 use crate::task::{self, Task};
 use crate::theme;
 use crate::update::{self, Release};
 use egui::{RichText, Ui};
+use kgui_core::build_info;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

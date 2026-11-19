@@ -1,7 +1,6 @@
 mod about;
 mod ansi;
 mod app;
-mod build_info;
 mod console;
 mod dialogs;
 mod history_view;
@@ -13,13 +12,18 @@ mod terminal;
 mod theme;
 mod update;
 
-use kgui_core::{env, history::History, settings};
+use kgui_core::{cli, env, history::History, link, settings};
 
 fn main() -> eframe::Result {
     // The app binary doubles as the `kgui` CLI (`.kamal/secrets` calls `kgui secret`).
     let args: Vec<String> = std::env::args().collect();
-    if let Some(code) = kgui_core::cli::dispatch(&args) {
+    if let Some(code) = cli::dispatch(&args) {
         std::process::exit(code);
+    }
+    // Started as `kgui` (through the link) it is a command line tool only: a
+    // mistyped command prints the usage instead of opening a second window.
+    if cli::invoked_as_kgui(&args) {
+        std::process::exit(cli::main(&args));
     }
 
     install_kgui_shim();
@@ -53,17 +57,18 @@ fn main() -> eframe::Result {
 }
 
 /// `.kamal/secrets` calls `kgui secret …`. Expose this binary as `kgui` in a
-/// directory that is put first on PATH for every kamal process.
+/// directory that is put first on PATH for every kamal process. The `kgui` in
+/// the user's terminal is a link to this one (see `kgui_core::link`).
 fn install_kgui_shim() {
     // Private data dir first: kamal runs whatever is called `kgui` in here.
     let _ = settings::ensure_data_dir();
-    let dir = settings::data_dir().join("bin");
-    if let (Ok(()), Ok(exe)) = (std::fs::create_dir_all(&dir), std::env::current_exe()) {
-        let link = dir.join("kgui");
-        if std::fs::read_link(&link).ok().as_deref() != Some(exe.as_path()) {
-            let _ = std::fs::remove_file(&link);
-            let _ = std::os::unix::fs::symlink(&exe, &link);
-        }
+    let shim = link::shim_path();
+    // With links followed: for a binary started through a link, `current_exe`
+    // is that link.
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        let _ = link::point_shim(&shim, &exe);
     }
-    env::set_extra_bin_dir(dir);
+    if let Some(dir) = shim.parent() {
+        env::set_extra_bin_dir(dir.to_path_buf());
+    }
 }
