@@ -388,6 +388,21 @@ pub fn github_web(url: &str) -> Option<String> {
 
 /// Text that opens `url` in the browser: looks like the surrounding text,
 /// underlined with a hand cursor on hover. Plain text when `url` is None.
+/// Text that opens a menu: a small chevron after it, underlined on hover.
+pub fn menu_label(ui: &mut Ui, text: RichText, enabled: bool) -> egui::Response {
+    let r = ui.add_enabled(enabled, egui::Label::new(text).sense(egui::Sense::click()));
+    let (chev, _) = ui.allocate_exact_size(vec2(15.0, r.rect.height()), egui::Sense::hover());
+    let color = ui.visuals().text_color().gamma_multiply(0.6);
+    let c = chev.center() + vec2(1.5, 1.5);
+    let stroke = Stroke::new(1.3, color);
+    ui.painter().line_segment([c + vec2(-3.5, -3.5), c], stroke);
+    ui.painter().line_segment([c, c + vec2(3.5, -3.5)], stroke);
+    if r.hovered() {
+        ui.painter().hline(r.rect.x_range(), r.rect.bottom() - 1.0, Stroke::new(1.0, color));
+    }
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub fn subtle_link(ui: &mut Ui, text: RichText, url: Option<&str>) -> egui::Response {
     let Some(url) = url else { return ui.label(text) };
     let r = ui

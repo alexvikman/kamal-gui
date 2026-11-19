@@ -63,15 +63,18 @@ Updating is disabled while a deploy is running.
   The app keeps its own bare clone of each one in
   `~/Library/Application Support/kgui/repos/`. Your working copies are never read or touched.
 - **Deploys run from a dedicated worktree** (`…/kgui/worktrees/<project>`) checked out at
-  the commit you pick: the default branch, one of the latest commits, any branch or tag.
+  the commit you pick: the followed branch, one of the latest commits, any branch or tag.
   You can keep working (dirty tree and all) while a deploy runs.
-- **Deploy units** come from `config/deploy*.yml` on origin's default branch and are grouped into targets:
+- **Each project follows a branch**: origin's default branch unless you pick another one from the
+  branch name under the project's title (or with `kgui branch`). Deploy defaults to it, and
+  "behind" counts from it.
+- **Deploy units** come from `config/deploy*.yml` on the followed branch and are grouped into targets:
   - `deploy.yml` + `deploy.workers.yml` → target `default` (web + workers)
   - `deploy.ff.yml` without `servers`/`registry`/`builder` → destination, run as `-c config/deploy.yml -d ff`
   - `deploy.acme.yml` with a full config → standalone, `-c config/deploy.acme.yml`
 - **Status** comes straight from Docker on each host (`ssh <user>@<host> docker ps`, using Kamal's
   `service`/`role`/`destination` labels). It shows which commit runs where, how far behind the
-  default branch it is, and which older versions you can roll back to. The last check is saved per
+  followed branch it is, and which older versions you can roll back to. The last check is saved per
   project and shown at startup; origin and the servers are only asked again on **Refresh** or after a
   run in the project. Checks share one ssh connection per server and run at most three at a time
   per server.
@@ -126,6 +129,7 @@ kgui projects                          # projects and their deploy targets
 kgui add GIT_URL                       # add a project (clones it)
 kgui remove PROJECT                    # remove a project and its clone
 kgui fetch PROJECT                     # fetch from origin
+kgui branch PROJECT [BRANCH|--default] # show or set the branch a project follows
 kgui status PROJECT                    # containers per host
 kgui secret op://VAULT/ITEM/FIELD      # for .kamal/secrets
 kgui migrate-secrets [--write] FILE…

@@ -446,11 +446,11 @@ struct Checkout {
 
 /// Fetch the project and check out the commit to run kamal against: the
 /// requested ref for deploys, otherwise whatever the deploy worktree has (the
-/// last deployed commit), falling back to the default branch.
+/// last deployed commit), falling back to the branch the project follows.
 fn checkout(project_name: &str, uses_ref: bool, git_ref: Option<String>) -> anyhow::Result<Checkout> {
     let p = project::find(project_name)?;
     let mirror = git::ensure_mirror(&p.name, &p.url)?;
-    let default = git::default_branch(&mirror);
+    let default = git::tracked_branch(&mirror, p.branch.as_deref());
     let (rev, from_worktree) = match (uses_ref, git::worktree_head(&p.name)) {
         (true, _) => (git_ref.unwrap_or(default), false),
         (false, Some(head)) => (head, true),

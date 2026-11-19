@@ -141,6 +141,29 @@ pub fn default_branch(mirror: &Path) -> String {
     "origin/main".into()
 }
 
+/// The branch the app follows for a project: `origin/<branch>` when one is
+/// chosen and origin has it, otherwise origin's default branch.
+pub fn tracked_branch(mirror: &Path, branch: Option<&str>) -> String {
+    match branch {
+        Some(b) if has_branch(mirror, b) => format!("origin/{b}"),
+        _ => default_branch(mirror),
+    }
+}
+
+/// Whether origin has a branch named `branch` (as of the last fetch).
+pub fn has_branch(mirror: &Path, branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && run(git(mirror).args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("refs/remotes/origin/{branch}^{{commit}}"),
+        ]))
+        .is_ok()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Commit {
     pub sha: String,
@@ -270,28 +293,57 @@ pub fn worktree_head(project: &str) -> Option<String> {
 /// Everything the deploy picker needs for one project.
 #[derive(Debug, Clone, Serialize)]
 pub struct RefList {
-    pub default_branch: String,
+    /// The branch the project follows (`origin/develop`).
+    pub branch: String,
     pub refs: Vec<GitRef>,
     pub commits: Vec<Commit>,
     /// Commit in the deploy worktree (the last thing deployed from the app).
     pub worktree_head: Option<String>,
 }
 
-pub fn ref_list(project: &str) -> Result<RefList> {
+pub fn ref_list(project: &str, branch: Option<&str>) -> Result<RefList> {
     let mirror = mirror_dir(project);
     anyhow::ensure!(mirror.join("HEAD").exists(), "project has not been cloned yet");
-    let default_branch = default_branch(&mirror);
+    let branch = tracked_branch(&mirror, branch);
     Ok(RefList {
         refs: refs(&mirror)?,
-        commits: log(&mirror, &default_branch, 30)?,
+        commits: log(&mirror, &branch, 30)?,
         worktree_head: worktree_head(project),
-        default_branch,
+        branch,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follows_a_chosen_branch_while_origin_has_it() {
+        let dir = std::env::temp_dir().join(format!("kgui-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mirror = dir.join("m.git");
+        let sh = |args: &[&str]| assert!(std::process::Command::new("git").args(args).status().unwrap().success());
+        let m = mirror.to_str().unwrap();
+        sh(&["init", "-q", "--bare", m]);
+        let tree = run(git(&mirror).args(["hash-object", "-w", "-t", "tree", "/dev/null"])).unwrap();
+        let commit = run(git(&mirror)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .args(["commit-tree", "-m", "c", &tree]))
+        .unwrap();
+        for r in ["refs/remotes/origin/main", "refs/remotes/origin/develop"] {
+            sh(&["--git-dir", m, "update-ref", r, &commit]);
+        }
+        assert_eq!(tracked_branch(&mirror, None), "origin/main");
+        assert_eq!(tracked_branch(&mirror, Some("develop")), "origin/develop");
+        // Gone from origin (or never there): back to the default branch.
+        assert_eq!(tracked_branch(&mirror, Some("feature")), "origin/main");
+        assert!(!has_branch(&mirror, "--help"));
+        assert!(!has_branch(&mirror, ""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn origin_urls() {

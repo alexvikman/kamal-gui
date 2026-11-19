@@ -315,10 +315,10 @@ pub struct ProjectStatus {
     pub base_current: HashMap<String, bool>,
 }
 
-/// Commit subject and how far behind the default branch each running
+/// Commit subject and how far behind the followed branch each running
 /// version is, from the app's clone (no network).
 fn versions_of(detail: &crate::project::ProjectDetail, hosts: &[HostStatus]) -> HashMap<String, VersionInfo> {
-    let rev = &detail.default_branch;
+    let rev = &detail.branch;
     let mirror = crate::git::mirror_dir(&detail.project.name);
     let shas: std::collections::BTreeSet<&str> = hosts
         .iter()

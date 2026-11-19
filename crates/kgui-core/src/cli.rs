@@ -14,6 +14,7 @@ const USAGE: &str = "kgui — Kamal GUI command line
   kgui add GIT_URL                        Add a project (clones it)
   kgui remove PROJECT                     Remove a project and its clone
   kgui fetch PROJECT                      Fetch a project from origin
+  kgui branch PROJECT [BRANCH|--default]  Show or set the branch a project follows
   kgui status PROJECT                     Show containers per host
   kgui doctor                             Show which kamal, op and gh will be used
 ";
@@ -30,6 +31,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         "add" => add(rest),
         "remove" => remove(rest),
         "fetch" => fetch(rest),
+        "branch" => branch(rest),
         "status" => status_cmd(rest),
         "doctor" => doctor(),
         "help" | "--help" | "-h" => {
@@ -102,7 +104,7 @@ fn projects() -> Result<()> {
                         format!("{}[{}]", t.id, kinds.join("+"))
                     })
                     .collect();
-                println!("{:<36} {:<14} {}", p.name, detail.default_branch, targets.join(" "));
+                println!("{:<36} {:<14} {}", p.name, detail.branch, targets.join(" "));
             }
             Err(e) => println!("{:<36} error: {e:#}", p.name),
         }
@@ -123,12 +125,27 @@ fn remove(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn branch(args: &[String]) -> Result<()> {
+    let (name, set) = match args {
+        [name] => (name, None),
+        [name, b] => (name, Some(b.as_str())),
+        _ => bail!("usage: kgui branch PROJECT [BRANCH|--default]"),
+    };
+    if let Some(b) = set {
+        project::set_branch(name, (b != "--default").then_some(b))?;
+    }
+    let d = project::load_detail(project::find(name)?)?;
+    let how = if d.project.branch.is_some() { "" } else { " (origin's default branch)" };
+    println!("{name} follows {}{how}", d.branch);
+    Ok(())
+}
+
 fn fetch(args: &[String]) -> Result<()> {
     let name = one(args, "kgui fetch PROJECT")?;
     project::fetch(name)?;
     let d = project::load_detail(project::find(name)?)?;
     if let Some(c) = d.commit {
-        println!("{name}: {} {} {}", d.default_branch, c.short, c.subject);
+        println!("{name}: {} {} {}", d.branch, c.short, c.subject);
     }
     Ok(())
 }

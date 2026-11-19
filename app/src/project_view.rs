@@ -50,6 +50,8 @@ pub struct ProjectView {
     load: Option<Task<Loaded>>,
     fetch: Option<Task<ProjectDetail>>,
     refs_task: Option<Task<RefList>>,
+    /// Switching the branch the project follows.
+    branch_task: Option<Task<ProjectDetail>>,
     status_task: Option<Task<ProjectStatus>>,
     /// What the status check is waiting on, and since when.
     status_progress: status::Progress,
@@ -73,6 +75,7 @@ impl ProjectView {
             load: None,
             fetch: None,
             refs_task: None,
+            branch_task: None,
             status_task: None,
             status_progress: status::Progress::default(),
             status_started: None,
@@ -106,7 +109,16 @@ impl ProjectView {
 
     fn load_refs(&mut self, ctx: &egui::Context) {
         let n = self.name.clone();
-        self.refs_task = Some(Task::spawn(ctx, move || git::ref_list(&n)));
+        self.refs_task = Some(Task::spawn(ctx, move || git::ref_list(&n, project::find(&n)?.branch.as_deref())));
+    }
+
+    /// Follow `branch` instead of origin's default branch (`None`: go back to it).
+    fn follow_branch(&mut self, ctx: &egui::Context, branch: Option<String>) {
+        let n = self.name.clone();
+        self.branch_task = Some(Task::spawn(ctx, move || {
+            project::set_branch(&n, branch.as_deref())?;
+            project::load_detail(project::find(&n)?)
+        }));
     }
 
     fn fetch_origin(&mut self, ctx: &egui::Context) {
@@ -204,6 +216,19 @@ impl ProjectView {
             && let (Some(s), Some(d)) = (&mut self.status, &self.detail)
         {
             s.update_versions(d);
+        }
+        match task::poll(&mut self.branch_task) {
+            Some(Ok(d)) => {
+                // Picks in the deploy menus were made against the old branch.
+                self.selected.clear();
+                if let Some(s) = &mut self.status {
+                    s.update_versions(&d);
+                }
+                self.detail = Some(d);
+                self.load_refs(ctx);
+            }
+            Some(Err(e)) => self.error = Some(format!("Couldn't change the branch: {e}")),
+            None => {}
         }
         match task::poll(&mut self.refs_task) {
             Some(Ok(r)) => self.refs = Some(r),
@@ -365,15 +390,17 @@ impl ProjectView {
 
         let muted = |s: String| RichText::new(s).size(12.5).color(p.muted);
         let mut parts = Vec::new();
+        let mut follow = None;
+        // Changing branch while origin or the servers are being asked would
+        // let their answer (for the old branch) land after the switch.
+        let busy = self.fetch.is_some() || self.status_task.is_some() || self.branch_task.is_some();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             if let Some(d) = &self.detail {
                 let web = theme::github_web(&d.project.url);
                 theme::subtle_link(ui, muted(theme::short_url(&d.project.url)), web.as_deref());
                 ui.label(muted("  ·  ".into()));
-                let branch = d.default_branch.trim_start_matches("origin/").to_string();
-                let branch_url = web.as_ref().map(|w| format!("{w}/tree/{branch}"));
-                theme::subtle_link(ui, muted(branch), branch_url.as_deref());
+                follow = branch_menu(ui, d, self.refs.as_ref(), busy, muted);
                 if let Some(c) = &d.commit {
                     ui.label(muted(" @ ".into()));
                     let commit_url = web.as_ref().map(|w| format!("{w}/commit/{}", c.sha));
@@ -389,6 +416,9 @@ impl ProjectView {
                 ui.label(muted(format!("  ·  {part}")));
             }
         });
+        if let Some(branch) = follow {
+            self.follow_branch(ctx, branch);
+        }
     }
 
     fn header_status(&self, parts: &mut Vec<String>) {
@@ -432,10 +462,8 @@ impl ProjectView {
             ui.add_space(8.0);
         }
         for t in &detail.targets {
-            let current = self
-                .refs
-                .as_ref()
-                .map(|r| self.selected.get(&t.id).cloned().unwrap_or_else(|| r.default_branch.clone()));
+            let current =
+                self.refs.as_ref().map(|r| self.selected.get(&t.id).cloned().unwrap_or_else(|| r.branch.clone()));
             let mut new_selection = None;
             target_header(
                 ui,
@@ -462,7 +490,7 @@ impl ProjectView {
                         deploying: running.is_some_and(|r| r.units.contains(&unit.id)),
                         queued: running.is_some_and(|r| r.queued),
                         repo: theme::github_web(&detail.project.url),
-                        branch: detail.default_branch.trim_start_matches("origin/").to_string(),
+                        branch: detail.branch.trim_start_matches("origin/").to_string(),
                     };
                     unit_rows(ui, p, unit, &cx, requests);
                 }
@@ -562,25 +590,70 @@ fn target_header(
     });
 }
 
+/// The followed branch in the header, as a menu to follow another one.
+/// Returns the new choice: `Some(None)` for origin's default branch.
+fn branch_menu(
+    ui: &mut Ui,
+    d: &ProjectDetail,
+    refs: Option<&RefList>,
+    busy: bool,
+    muted: impl Fn(String) -> RichText,
+) -> Option<Option<String>> {
+    let short = |b: &str| b.trim_start_matches("origin/").to_string();
+    let current = short(&d.branch);
+    let default = short(&d.default_branch);
+    let hover = if busy {
+        "Branch this project follows. Can be changed once the refresh is done."
+    } else {
+        "Branch this project follows: what Deploy uses and what \"behind\" counts from. Click to change."
+    };
+    let resp = theme::menu_label(ui, muted(current.clone()), !busy);
+    let resp = if busy { resp.on_disabled_hover_text(hover) } else { resp.on_hover_text(hover) };
+    let mut pick = None;
+    egui::Popup::menu(&resp).align(egui::RectAlign::BOTTOM_START).show(|ui| {
+        ui.set_min_width(240.0);
+        ui.label(theme::caption("Follow branch"));
+        if theme::check_item(ui, &format!("{default} (default)"), d.project.branch.is_none()).clicked() {
+            pick = Some(None);
+        }
+        let branches: Vec<String> = refs
+            .map(|r| r.refs.iter().filter(|r| r.kind == "branch").map(|r| short(&r.name)).collect())
+            .unwrap_or_default();
+        let others: Vec<&String> = branches.iter().filter(|b| **b != default).collect();
+        if !others.is_empty() {
+            ui.separator();
+            ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for b in others {
+                    if theme::check_item(ui, b, d.project.branch.as_deref() == Some(b.as_str())).clicked() {
+                        pick = Some(Some(b.clone()));
+                    }
+                }
+            });
+        }
+        if let Some(web) = theme::github_web(&d.project.url) {
+            ui.separator();
+            if ui.button(format!("Open {current} on GitHub")).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{web}/tree/{current}")));
+                ui.close();
+            }
+        }
+    });
+    // Picking what's already followed changes nothing.
+    pick.filter(|p| p.as_deref() != d.project.branch.as_deref())
+}
+
 fn ref_picker(ui: &mut Ui, target: &str, refs: &RefList, current: &str, new_selection: &mut Option<String>) {
     let mut sel = current.to_string();
     let short = |s: &str| truncate(s, 56);
-    let latest = format!("{} (latest)", refs.default_branch.trim_start_matches("origin/"));
+    let latest = format!("{} (latest)", refs.branch.trim_start_matches("origin/"));
     egui::ComboBox::from_id_salt(("ref", target))
         .width(280.0)
         .height(480.0)
-        .selected_text(if sel == refs.default_branch {
-            latest.clone()
-        } else {
-            short(&ref_label(Some(refs), Some(&sel)))
-        })
+        .selected_text(if sel == refs.branch { latest.clone() } else { short(&ref_label(Some(refs), Some(&sel))) })
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut sel, refs.default_branch.clone(), latest);
+            ui.selectable_value(&mut sel, refs.branch.clone(), latest);
             ui.separator();
-            ui.label(theme::caption(format!(
-                "Recent commits on {}",
-                refs.default_branch.trim_start_matches("origin/")
-            )));
+            ui.label(theme::caption(format!("Recent commits on {}", refs.branch.trim_start_matches("origin/"))));
             for c in &refs.commits {
                 ui.selectable_value(
                     &mut sel,
@@ -1507,5 +1580,125 @@ mod bench {
         }
         let targets = view.detail.as_ref().map(|d| d.targets.len()).unwrap_or(0);
         println!("{name}: {targets} targets  steady frame {:?}", t.elapsed() / n);
+    }
+}
+
+#[cfg(test)]
+mod branch_menu_tests {
+    use super::*;
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect};
+    use kgui_core::git::GitRef;
+
+    fn detail(branch: Option<&str>) -> ProjectDetail {
+        ProjectDetail {
+            project: project::Project {
+                name: "app".into(),
+                url: "git@github.com:org/app.git".into(),
+                added_at: 0,
+                branch: branch.map(String::from),
+            },
+            branch: format!("origin/{}", branch.unwrap_or("develop")),
+            default_branch: "origin/develop".into(),
+            commit: None,
+            targets: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn refs() -> RefList {
+        let r = |name: &str| GitRef {
+            name: name.into(),
+            kind: "branch".into(),
+            sha: "0".repeat(40),
+            time: 0,
+            subject: String::new(),
+        };
+        RefList {
+            branch: "origin/develop".into(),
+            refs: vec![r("origin/develop"), r("origin/master")],
+            commits: vec![],
+            worktree_head: None,
+        }
+    }
+
+    /// Run frames with `events`, returning the menu's pick and where each
+    /// piece of text was drawn.
+    fn frame(
+        ctx: &egui::Context,
+        d: &ProjectDetail,
+        events: Vec<Event>,
+    ) -> (Option<Option<String>>, Vec<(String, Rect)>) {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let mut pick = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let r = refs();
+                    pick = branch_menu(ui, d, Some(&r), false, RichText::new);
+                });
+            });
+        });
+        out.textures_delta.clear();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect();
+        (pick, texts)
+    }
+
+    fn click(ctx: &egui::Context, d: &ProjectDetail, at: Pos2) -> (Option<Option<String>>, Vec<(String, Rect)>) {
+        frame(ctx, d, vec![Event::PointerMoved(at)]);
+        let press = Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        frame(ctx, d, vec![press]);
+        let release = Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        frame(ctx, d, vec![release])
+    }
+
+    fn find(texts: &[(String, Rect)], text: &str) -> Rect {
+        texts.iter().find(|(t, _)| t == text).map(|(_, r)| *r).unwrap_or_else(|| panic!("no {text:?} drawn"))
+    }
+
+    #[test]
+    fn picks_another_branch_to_follow() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let d = detail(None);
+        let (_, texts) = frame(&ctx, &d, vec![]);
+        let (pick, _) = click(&ctx, &d, find(&texts, "develop").center());
+        assert_eq!(pick, None);
+        let (_, texts) = frame(&ctx, &d, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "develop (default)"), "menu didn't open");
+        let (pick, _) = click(&ctx, &d, find(&texts, "master").center());
+        assert_eq!(pick, Some(Some("master".into())));
+    }
+
+    #[test]
+    fn goes_back_to_the_default_branch() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let d = detail(Some("master"));
+        let (_, texts) = frame(&ctx, &d, vec![]);
+        click(&ctx, &d, find(&texts, "master").center());
+        let (_, texts) = frame(&ctx, &d, vec![]);
+        let (pick, _) = click(&ctx, &d, find(&texts, "develop (default)").center());
+        assert_eq!(pick, Some(None));
     }
 }

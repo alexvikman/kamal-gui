@@ -1,6 +1,7 @@
 //! Projects are git repositories added to the app by URL. The app keeps its
-//! own bare clone of each one and reads deploy configs from origin's default
-//! branch, so nothing depends on a working copy on disk.
+//! own bare clone of each one and reads deploy configs from the branch it
+//! follows (origin's default branch unless another is chosen), so nothing
+//! depends on a working copy on disk.
 //!
 //! Each `config/deploy*.yml` becomes a deploy unit, grouped into targets:
 //!
@@ -25,6 +26,9 @@ pub struct Project {
     pub name: String,
     pub url: String,
     pub added_at: i64,
+    /// Branch to follow instead of origin's default branch (`develop`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 fn registry_path() -> PathBuf {
@@ -82,7 +86,7 @@ pub fn add(url: &str) -> Result<Project> {
     let _guard = registry_lock();
     let mut projects = list();
     ensure_new(&projects, &name)?;
-    let project = Project { name, url: url.to_string(), added_at: crate::history::now_ms() };
+    let project = Project { name, url: url.to_string(), added_at: crate::history::now_ms(), branch: None };
     projects.push(project.clone());
     save(&projects)?;
     Ok(project)
@@ -106,6 +110,21 @@ pub fn remove(name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Follow `branch` (a branch on origin) instead of origin's default branch,
+/// or go back to the default branch with `None`.
+pub fn set_branch(name: &str, branch: Option<&str>) -> Result<Project> {
+    if let Some(b) = branch {
+        anyhow::ensure!(git::has_branch(&git::mirror_dir(name), b), "origin has no branch named {b}");
+    }
+    let _guard = registry_lock();
+    let mut projects = list();
+    let p = projects.iter_mut().find(|p| p.name == name).with_context(|| format!("no project named {name}"))?;
+    p.branch = branch.map(String::from);
+    let project = p.clone();
+    save(&projects)?;
+    Ok(project)
 }
 
 pub fn fetch(name: &str) -> Result<()> {
@@ -149,7 +168,10 @@ pub struct Target {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectDetail {
     pub project: Project,
-    /// `origin/main` (whatever origin's HEAD points at).
+    /// The branch the project follows: `origin/<branch>` when one is chosen,
+    /// otherwise origin's default branch (`origin/main`).
+    pub branch: String,
+    /// Origin's default branch (`origin/main`), whichever branch is followed.
     pub default_branch: String,
     pub commit: Option<git::Commit>,
     pub targets: Vec<Target>,
@@ -256,19 +278,32 @@ pub fn build_targets(files: &[String], read: impl Fn(&str) -> Option<String>) ->
     (targets, errors)
 }
 
-/// Targets as defined on origin's default branch, read from the app's clone.
+/// Targets as defined on the branch the project follows, read from the app's clone.
 pub fn load_detail(project: Project) -> Result<ProjectDetail> {
     let mirror = git::mirror_dir(&project.name);
     if !mirror.join("HEAD").exists() {
         git::ensure_mirror(&project.name, &project.url)?;
     }
-    let rev = git::default_branch(&mirror);
+    let default_branch = git::default_branch(&mirror);
+    let rev = git::tracked_branch(&mirror, project.branch.as_deref());
     let files = git::list_config_files(&mirror, &rev).unwrap_or_default();
     let (targets, mut errors) = build_targets(&files, |p| git::show(&mirror, &rev, p));
+    if let Some(b) = &project.branch
+        && rev != format!("origin/{b}")
+    {
+        errors.insert(0, format!("Origin has no branch {b} any more. Following {rev} instead."));
+    }
     if targets.is_empty() && errors.is_empty() {
         errors.push(format!("no config/deploy*.yml on {rev}"));
     }
-    Ok(ProjectDetail { commit: git::resolve(&mirror, &rev).ok(), default_branch: rev, targets, errors, project })
+    Ok(ProjectDetail {
+        commit: git::resolve(&mirror, &rev).ok(),
+        branch: rev,
+        default_branch,
+        targets,
+        errors,
+        project,
+    })
 }
 
 /// Targets from config files on disk (the deploy worktree).
