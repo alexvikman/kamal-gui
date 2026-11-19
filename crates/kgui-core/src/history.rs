@@ -5,6 +5,7 @@ use crate::settings::data_dir;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,7 +41,11 @@ impl History {
     pub fn open() -> Result<Self> {
         let dir = crate::settings::ensure_data_dir()?;
         std::fs::create_dir_all(dir.join("logs"))?;
-        let conn = Connection::open(dir.join("history.sqlite"))?;
+        Self::open_at(&dir.join("history.sqlite"))
+    }
+
+    fn open_at(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS runs (
@@ -54,7 +59,11 @@ impl History {
                status TEXT NOT NULL,
                exit_code INTEGER
              );
-             CREATE INDEX IF NOT EXISTS runs_project ON runs(project, id DESC);",
+             CREATE INDEX IF NOT EXISTS runs_project ON runs(project, id DESC);
+             CREATE TABLE IF NOT EXISTS deploys (
+               project TEXT PRIMARY KEY,
+               at INTEGER NOT NULL
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -92,6 +101,32 @@ impl History {
         Ok(())
     }
 
+    /// A deploy seen on the servers (the newest app container's creation
+    /// time), so deploys from the kamal CLI count too. Keeps the latest.
+    pub fn record_deploy(&self, project: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO deploys (project, at) VALUES (?1, ?2)
+             ON CONFLICT(project) DO UPDATE SET at = max(at, excluded.at)",
+            params![project, at],
+        )?;
+        Ok(())
+    }
+
+    /// When each project was last deployed, as far as we know: from the
+    /// servers, or from a successful deploy run in the app.
+    pub fn last_deploys(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project, max(at) FROM (
+               SELECT project, at FROM deploys
+               UNION ALL
+               SELECT project, finished_at FROM runs
+                 WHERE action = 'deploy' AND status = 'ok' AND finished_at IS NOT NULL
+             ) GROUP BY project",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Run>> {
         Ok(self.conn.query_row(&format!("SELECT {COLS} FROM runs WHERE id=?1"), params![id], row).optional()?)
     }
@@ -121,4 +156,31 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Run> {
         status: r.get(9)?,
         exit_code: r.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_deploy_is_the_newest_seen() {
+        let path = std::env::temp_dir().join(format!("kgui-history-{}.sqlite", std::process::id()));
+        let h = History::open_at(&path).unwrap();
+        h.record_deploy("a", 2_000).unwrap();
+        h.record_deploy("a", 1_000).unwrap();
+        let id = h.start("b", "web", "deploy").unwrap();
+        h.finish(id, "ok", Some(0)).unwrap();
+        let failed = h.start("c", "web", "deploy").unwrap();
+        h.finish(failed, "failed", Some(1)).unwrap();
+        let other = h.start("c", "web", "app logs").unwrap();
+        h.finish(other, "ok", Some(0)).unwrap();
+        let last = h.last_deploys().unwrap();
+        assert_eq!(last.get("a"), Some(&2_000));
+        assert!(last.get("b").is_some_and(|&t| t > 2_000));
+        assert_eq!(last.get("c"), None);
+        drop(h);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
 }

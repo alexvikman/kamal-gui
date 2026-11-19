@@ -95,6 +95,25 @@ pub struct KamalApp {
     update_check: Option<crate::task::Task<crate::update::Release>>,
     last_update_check: Option<std::time::Instant>,
     update_available: Option<crate::update::Release>,
+    /// How the sidebar orders projects, and when each was last deployed.
+    sort: ProjectSort,
+    last_deploy: std::collections::HashMap<String, i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSort {
+    #[default]
+    Name,
+    LastDeploy,
+}
+
+/// What the app remembers between launches (`ui.json`).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct UiState {
+    project: Option<String>,
+    #[serde(default)]
+    sort: ProjectSort,
 }
 
 impl KamalApp {
@@ -104,7 +123,8 @@ impl KamalApp {
         let ctx = cc.egui_ctx.clone();
         let runner = Runner::new(tx, Arc::new(move || ctx.request_repaint()));
         let projects = project::list();
-        let current = load_selected().filter(|n| projects.iter().any(|p| &p.name == n));
+        let state = load_ui_state();
+        let current = state.project.filter(|n| projects.iter().any(|p| &p.name == n));
         let views = current.iter().map(|n| (n.clone(), ProjectView::new(&cc.egui_ctx, n))).collect();
         Self {
             runner,
@@ -132,6 +152,8 @@ impl KamalApp {
             last_update_check: None,
             update_available: None,
             quitting: false,
+            sort: state.sort,
+            last_deploy: kgui_core::history::History::open().and_then(|h| h.last_deploys()).unwrap_or_default(),
         }
     }
 
@@ -159,8 +181,23 @@ impl KamalApp {
         if name.is_none() {
             self.all_history.reload();
         }
-        save_selected(name.as_deref());
         self.current = name;
+        self.save_ui_state();
+    }
+
+    fn save_ui_state(&self) {
+        save_ui_state(&UiState { project: self.current.clone(), sort: self.sort });
+    }
+
+    /// Projects in sidebar order: by name, or most recently deployed first
+    /// (never-deployed ones last, by name).
+    fn sorted_projects(&self) -> Vec<&Project> {
+        let mut list: Vec<&Project> = self.projects.iter().collect();
+        list.sort_by_key(|p| p.name.to_lowercase());
+        if self.sort == ProjectSort::LastDeploy {
+            list.sort_by_key(|p| std::cmp::Reverse(self.last_deploy.get(&p.name).copied()));
+        }
+        list
     }
 
     fn reload_projects(&mut self) {
@@ -181,6 +218,27 @@ impl KamalApp {
             self.select(&ctx, None);
         }
         ui.separator();
+        ui.horizontal(|ui| {
+            // Line up with the project names' text.
+            ui.add_space(2.0);
+            ui.label(RichText::new("Projects").size(12.5).color(p.muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut sort = self.sort;
+                theme::sort_menu(ui, |ui| {
+                    ui.label(theme::caption("Sort by"));
+                    for (value, label) in [(ProjectSort::Name, "Name"), (ProjectSort::LastDeploy, "Last deploy")] {
+                        if theme::check_item(ui, label, sort == value).clicked() {
+                            sort = value;
+                            ui.close();
+                        }
+                    }
+                });
+                if sort != self.sort {
+                    self.sort = sort;
+                    self.save_ui_state();
+                }
+            });
+        });
 
         let running = self.console.running_projects();
         let running: Vec<String> = running.into_iter().map(String::from).collect();
@@ -189,9 +247,10 @@ impl KamalApp {
         let list_height = ui.available_height() - 40.0;
         ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]).show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                for proj in self.projects.iter().filter(|p| p.name.to_lowercase().contains(&q)) {
+                for proj in self.sorted_projects().into_iter().filter(|p| p.name.to_lowercase().contains(&q)) {
                     let selected = self.settings.is_none() && self.current.as_deref() == Some(proj.name.as_str());
                     let busy = running.contains(&proj.name);
+                    let deployed = self.last_deploy.get(&proj.name).copied();
                     let r = ui.selectable_label(selected, &proj.name);
                     if busy {
                         let rect = egui::Rect::from_center_size(
@@ -199,8 +258,22 @@ impl KamalApp {
                             egui::vec2(14.0, 14.0),
                         );
                         egui::Spinner::new().color(theme::ACCENT).paint_at(ui, rect);
+                    } else if let Some(t) = deployed.filter(|_| self.sort == ProjectSort::LastDeploy) {
+                        ui.painter().text(
+                            egui::pos2(r.rect.right() - 8.0, r.rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            theme::ago_short(t),
+                            egui::FontId::proportional(12.0),
+                            p.muted,
+                        );
                     }
-                    let hover = if busy { format!("{}\nA run is in progress", proj.url) } else { proj.url.clone() };
+                    let mut hover = proj.url.clone();
+                    if let Some(t) = deployed {
+                        hover += &format!("\nDeployed {} ({})", theme::ago(t), theme::date_time_short(t));
+                    }
+                    if busy {
+                        hover += "\nA run is in progress";
+                    }
                     if r.on_hover_text(hover).clicked() {
                         pick = Some(proj.name.clone());
                     }
@@ -481,6 +554,12 @@ impl eframe::App for KamalApp {
         let ctx = ui.ctx().clone();
         while let Ok(event) = self.events.try_recv() {
             if let Some(run) = self.console.handle(event) {
+                if run.action == "deploy"
+                    && run.status == "ok"
+                    && let Some(t) = run.finished_at
+                {
+                    note_deploy(&mut self.last_deploy, &run.project, t);
+                }
                 self.all_history.on_run_updated(&run);
                 for v in self.views.values_mut() {
                     v.on_run_updated(&ctx, &run);
@@ -521,6 +600,12 @@ impl eframe::App for KamalApp {
         for r in requests {
             self.handle(&ctx, r);
         }
+        // Status checks see deploys made outside the app too.
+        for v in self.views.values() {
+            if let Some(t) = v.last_deploy() {
+                note_deploy(&mut self.last_deploy, &v.name, t);
+            }
+        }
         self.dialogs(&ctx);
     }
 }
@@ -529,13 +614,18 @@ fn ui_state_path() -> std::path::PathBuf {
     data_dir().join("ui.json")
 }
 
-fn load_selected() -> Option<String> {
-    let text = std::fs::read_to_string(ui_state_path()).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("project")?.as_str().map(String::from)
+fn load_ui_state() -> UiState {
+    std::fs::read_to_string(ui_state_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
-fn save_selected(name: Option<&str>) {
+fn save_ui_state(state: &UiState) {
     let _ = std::fs::create_dir_all(data_dir());
-    let _ = std::fs::write(ui_state_path(), serde_json::json!({ "project": name }).to_string());
+    if let Ok(text) = serde_json::to_string(state) {
+        let _ = std::fs::write(ui_state_path(), text);
+    }
+}
+
+fn note_deploy(map: &mut std::collections::HashMap<String, i64>, project: &str, at: i64) {
+    let t = map.entry(project.to_string()).or_insert(at);
+    *t = (*t).max(at);
 }

@@ -64,6 +64,15 @@ pub struct Container {
     pub image_source: Option<String>,
 }
 
+impl Container {
+    /// Docker's `CreatedAt` (`2026-11-18 20:20:13 +0100 CET`) as Unix ms.
+    pub fn created_ms(&self) -> Option<i64> {
+        let mut parts = self.created.split_whitespace();
+        let stamp = format!("{} {} {}", parts.next()?, parts.next()?, parts.next()?);
+        chrono::DateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S %z").ok().map(|d| d.timestamp_millis())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HostStatus {
     pub host: String,
@@ -226,16 +235,21 @@ pub struct ProjectStatus {
     /// Newest upstream release per image source URL.
     pub releases: HashMap<String, crate::images::Release>,
     pub checked_at: i64,
+    /// When the newest running app container was created: the last deploy,
+    /// whether it ran from the app or from the kamal CLI.
+    pub last_deploy: Option<i64>,
 }
 
 /// Containers of this project's services (apps and accessories) on every
 /// host the project uses, plus commit info for each running version.
 pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progress) -> ProjectStatus {
     let mut services = std::collections::HashSet::new();
+    let mut apps = std::collections::HashSet::new();
     let mut hosts: Vec<(String, SshTarget)> = Vec::new();
     for unit in detail.targets.iter().flat_map(|t| &t.units) {
         let c = &unit.config;
         services.extend(c.service.clone());
+        apps.extend(c.service.clone());
         let mut add = |h: &String| {
             if !hosts.iter().any(|(x, s)| x == h && *s == c.ssh) {
                 hosts.push((h.clone(), c.ssh.clone()));
@@ -287,7 +301,16 @@ pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progres
     if let Some(step) = step {
         progress.finish(step);
     }
-    ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms() }
+    let last_deploy = result
+        .iter()
+        .flat_map(|h| &h.containers)
+        .filter(|c| apps.contains(&c.service) && c.state == "running")
+        .filter_map(Container::created_ms)
+        .max();
+    if let Some(at) = last_deploy {
+        let _ = crate::history::History::open().and_then(|h| h.record_deploy(&detail.project.name, at));
+    }
+    ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms(), last_deploy }
 }
 
 #[cfg(test)]
@@ -296,6 +319,31 @@ mod tests {
 
     fn target(user: &str, proxy: Option<&str>) -> SshTarget {
         SshTarget { user: user.into(), port: 22, proxy: proxy.map(String::from) }
+    }
+
+    #[test]
+    fn reads_docker_created_at() {
+        let at = |created: &str| {
+            Container {
+                id: String::new(),
+                name: String::new(),
+                image: String::new(),
+                version: String::new(),
+                service: String::new(),
+                role: None,
+                destination: None,
+                state: String::new(),
+                status: String::new(),
+                created: created.into(),
+                image_version: None,
+                image_source: None,
+            }
+            .created_ms()
+        };
+        assert_eq!(at("2026-11-18 20:20:13 +0100 CET"), Some(1_795_029_613_000));
+        assert_eq!(at("2026-11-18 19:20:13 +0000 UTC"), Some(1_795_029_613_000));
+        assert_eq!(at("About an hour ago"), None);
+        assert_eq!(at(""), None);
     }
 
     #[test]

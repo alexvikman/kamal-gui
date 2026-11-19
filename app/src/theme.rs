@@ -8,6 +8,7 @@ pub const TEXT: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
 /// The app is light-only: white surfaces, near-black text.
 pub struct Palette {
     pub ok: Color32,
+    pub ok_soft: Color32,
     pub bad: Color32,
     pub bad_soft: Color32,
     pub warn: Color32,
@@ -57,6 +58,11 @@ pub fn install(ctx: &egui::Context) {
 
     let mut v = Visuals::light();
     let p = palette_static();
+    // egui's light theme blends raw glyph coverage, which reads thin next to
+    // macOS's own text; a gamma below 1 fills strokes out a little. Without
+    // hinting, glyphs keep their designed shapes, as Core Text renders them.
+    v.text_options.color_transfer_function = egui::epaint::FontColorTransferFunction::Gamma(0.8);
+    v.text_options.font_hinting = false;
     v.panel_fill = Color32::WHITE;
     v.window_fill = Color32::WHITE;
     v.extreme_bg_color = Color32::WHITE; // text inputs, scroll areas
@@ -122,6 +128,7 @@ pub fn install(ctx: &egui::Context) {
 fn palette_static() -> Palette {
     Palette {
         ok: Color32::from_rgb(0x1a, 0x7f, 0x45),
+        ok_soft: Color32::from_rgb(0xe8, 0xf5, 0xec),
         bad: Color32::from_rgb(0xc4, 0x3a, 0x31),
         bad_soft: Color32::from_rgb(0xfd, 0xec, 0xea),
         warn: Color32::from_rgb(0x8f, 0x5b, 0x00),
@@ -277,6 +284,60 @@ pub fn more_menu(ui: &mut Ui, hover: &str, menu: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// A small rounded label ("latest", "3 behind"), a link when `url` is set.
+pub fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, url: Option<&str>) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(12.0), fg);
+    let size = galley.size() + vec2(16.0, 6.0);
+    let sense = if url.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    ui.painter().rect_filled(rect, CornerRadius::same((size.y / 2.0) as u8), bg);
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
+    if let Some(url) = url {
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        return resp.on_hover_text(url);
+    }
+    resp
+}
+
+/// A small "sort / adjust" icon button (two sliders) that opens a menu.
+pub fn sort_menu(ui: &mut Ui, menu: impl FnOnce(&mut Ui)) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 22.0), egui::Sense::click());
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    if resp.hovered() || open {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(0xf0, 0xf0, 0xf2));
+    }
+    let color = palette_static().muted;
+    let stroke = Stroke::new(1.3, color);
+    let c = rect.center();
+    for (dy, knob) in [(-3.0, 2.5), (3.0, -2.5)] {
+        let y = c.y + dy;
+        ui.painter().line_segment([egui::pos2(c.x - 6.0, y), egui::pos2(c.x + 6.0, y)], stroke);
+        ui.painter().circle(egui::pos2(c.x + knob, y), 2.2, Color32::WHITE, stroke);
+    }
+    let resp = resp.on_hover_text("Sort projects");
+    egui::Popup::menu(&resp).align(egui::RectAlign::BOTTOM_END).show(|ui| {
+        ui.set_min_width(180.0);
+        menu(ui);
+    });
+}
+
+/// A menu item with a check mark on the right when it's the current choice.
+pub fn check_item(ui: &mut Ui, text: &str, checked: bool) -> egui::Response {
+    let r = ui.add(egui::Button::new(text).frame_when_inactive(false).right_text(""));
+    if checked {
+        let c = egui::pos2(r.rect.right() - 14.0, r.rect.center().y);
+        let stroke = Stroke::new(1.6, TEXT);
+        ui.painter().line_segment([c + vec2(-4.0, 0.0), c + vec2(-1.0, 3.0)], stroke);
+        ui.painter().line_segment([c + vec2(-1.0, 3.0), c + vec2(4.5, -3.5)], stroke);
+    }
+    r
+}
+
 /// Text tabs with an underline under the active one.
 pub fn tabs<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, items: &[(T, &str)]) {
     let p = palette_static();
@@ -376,6 +437,24 @@ fn ago_from(now: i64, ms: i64) -> String {
     }
 }
 
+/// Compact age for tight spots: `5m`, `11h`, `3d`, `2w`, `4mo`, `1y`.
+pub fn ago_short(ms: i64) -> String {
+    ago_short_from(chrono::Utc::now().timestamp_millis(), ms)
+}
+
+fn ago_short_from(now: i64, ms: i64) -> String {
+    const DAY: i64 = 86_400;
+    let s = (now - ms).max(0) / 1000;
+    match s {
+        0..3600 => format!("{}m", (s / 60).max(1)),
+        3600..DAY => format!("{}h", s / 3600),
+        _ if s < 14 * DAY => format!("{}d", s / DAY),
+        _ if s < 60 * DAY => format!("{}w", s / (7 * DAY)),
+        _ if s < 365 * DAY => format!("{}mo", s / (30 * DAY)),
+        _ => format!("{}y", s / (365 * DAY)),
+    }
+}
+
 pub fn date_time(ms: i64) -> String {
     use chrono::TimeZone;
     chrono::Local
@@ -417,6 +496,13 @@ mod tests {
         assert_eq!(ago(7 * 86_400), "7 days ago");
         assert_eq!(ago(90 * 86_400), "3 months ago");
         assert_eq!(ago(400 * 86_400), "1 year ago");
+        let short = |secs: i64| ago_short_from(now, now - secs * 1000);
+        assert_eq!(short(20), "1m");
+        assert_eq!(short(5 * 3600), "5h");
+        assert_eq!(short(3 * 86_400), "3d");
+        assert_eq!(short(15 * 86_400), "2w");
+        assert_eq!(short(90 * 86_400), "3mo");
+        assert_eq!(short(400 * 86_400), "1y");
     }
     use egui::{Event, Pos2, RawInput, Rect, Shape};
 

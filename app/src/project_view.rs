@@ -3,7 +3,6 @@ use crate::history_view::{HistoryView, truncate};
 use crate::task::{self, Task};
 use crate::theme::{self, Palette};
 use egui::{Align, Layout, RichText, ScrollArea, Ui, vec2};
-use kgui_core::config::UnitConfig;
 use kgui_core::git::{self, RefList};
 use kgui_core::history::Run;
 use kgui_core::images;
@@ -31,9 +30,6 @@ fn elapsed(started_at: i64) -> String {
     let s = ((chrono::Utc::now().timestamp_millis() - started_at) / 1000).max(0);
     if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
-
-/// Width of the service-name column in unit rows.
-const NAME_COL: f32 = 250.0;
 
 pub struct ProjectView {
     pub name: String,
@@ -85,6 +81,11 @@ impl ProjectView {
         // one at a time.
         v.fetch_origin(ctx);
         v
+    }
+
+    /// The last deploy the latest status check saw on the servers.
+    pub fn last_deploy(&self) -> Option<i64> {
+        self.status.as_ref()?.last_deploy
     }
 
     fn load_refs(&mut self, ctx: &egui::Context) {
@@ -416,14 +417,9 @@ impl ProjectView {
                 &mut new_selection,
                 requests,
             );
-            ui.add_space(8.0);
-            theme::card(ui, |ui| {
-                for (i, unit) in t.units.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                    }
+            ui.add_space(10.0);
+            {
+                for unit in &t.units {
                     let cx = UnitCtx {
                         project: &self.name,
                         status: self.status.as_ref(),
@@ -436,13 +432,13 @@ impl ProjectView {
                         repo: theme::github_web(&detail.project.url),
                         branch: detail.default_branch.trim_start_matches("origin/").to_string(),
                     };
-                    unit_row(ui, p, unit, &cx, requests);
+                    unit_rows(ui, p, unit, &cx, requests);
                 }
-            });
+            }
             if let Some(sel) = new_selection {
                 self.selected.insert(t.id.clone(), sel);
             }
-            ui.add_space(28.0);
+            ui.add_space(18.0);
         }
     }
 }
@@ -471,17 +467,17 @@ fn target_header(
     requests: &mut Vec<Request>,
 ) {
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(theme::title(if t.id == "default" { "Production" } else { &t.id }, 17.0));
-            let caption = if t.id == "default" {
-                "Default deploy configuration".to_string()
-            } else if t.units.iter().any(|u| u.destination.is_some()) {
-                format!("Kamal destination  ·  -d {}", t.id)
-            } else {
-                "Separate deploy configuration".to_string()
-            };
-            ui.label(theme::caption(caption));
-        });
+        ui.label(theme::title(if t.id == "default" { "Production" } else { &t.id }, 17.0));
+        let caption = if t.id == "default" {
+            None
+        } else if t.units.iter().any(|u| u.destination.is_some()) {
+            Some(format!("Kamal destination  ·  -d {}", t.id))
+        } else {
+            Some("Separate deploy configuration".to_string())
+        };
+        if let Some(c) = caption {
+            ui.label(theme::caption(c));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let this_target = running.is_some_and(|r| t.units.iter().any(|u| r.units.contains(&u.id)));
             let label = if this_target {
@@ -623,93 +619,22 @@ fn kind_label(kind: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
-/// One service: name and config on the left, live containers in the middle,
-/// actions on the right.
-fn unit_row(ui: &mut Ui, p: &Palette, unit: &Unit, cx: &UnitCtx, requests: &mut Vec<Request>) {
+/// What the latest status check found for one service.
+struct Live<'a> {
+    status: &'a ProjectStatus,
+    /// Running app containers and the host each runs on.
+    running: Vec<(&'a str, &'a Container)>,
+    /// Accessory name, host, and its container if there is one.
+    accessories: Vec<(&'a str, &'a str, Option<&'a Container>)>,
+    /// None of the service's hosts answered.
+    all_unreachable: bool,
+}
+
+fn live<'a>(unit: &'a Unit, status: &'a ProjectStatus) -> Live<'a> {
     let cfg = &unit.config;
-    let service = cfg.service.clone().unwrap_or_else(|| "(no service)".into());
-    let file = unit.config_file.trim_start_matches("config/");
-    let caption = match &unit.destination {
-        Some(d) => format!("{}  ·  {file} -d {d}", kind_label(&unit.kind)),
-        None => format!("{}  ·  {file}", kind_label(&unit.kind)),
-    };
-
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(vec2(NAME_COL, 0.0), Layout::top_down(Align::Min), |ui| {
-            ui.set_width(NAME_COL);
-            ui.label(RichText::new(&service).family(theme::medium()).size(14.5));
-            ui.label(theme::caption(caption));
-            if cx.deploying {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                    ui.label(RichText::new("Deploying…").size(12.5).color(theme::ACCENT));
-                });
-            }
-        });
-        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-            // The service's ⋯ sits at the end of its first line, in the same
-            // column as each accessory's ⋯, so all menus and links line up.
-            let mut menu_requests = Vec::new();
-            {
-                let mut menu = |ui: &mut Ui| unit_menu(ui, unit, cx, &service, &mut menu_requests);
-                containers(ui, p, unit, cfg, cx, requests, &mut menu);
-            }
-            requests.extend(menu_requests);
-            base_image_line(ui, p, unit, cx.status);
-        });
-    });
-}
-
-/// A line of text with the trailing menu slot on the right.
-fn line_with_menu(ui: &mut Ui, text: RichText, menu: &mut Option<&mut dyn FnMut(&mut Ui)>) {
-    ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            trailing_slot(ui, menu.take());
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.add(egui::Label::new(text).truncate());
-            });
-        });
-    });
-}
-
-/// Width every line reserves on the right for a ⋯ menu.
-const MENU_SLOT: f32 = 28.0;
-
-fn trailing_slot(ui: &mut Ui, menu: Option<&mut dyn FnMut(&mut Ui)>) {
-    match menu {
-        Some(menu) => menu(ui),
-        None => {
-            ui.add_space(MENU_SLOT);
-        }
-    }
-}
-
-fn containers(
-    ui: &mut Ui,
-    p: &Palette,
-    unit: &Unit,
-    cfg: &UnitConfig,
-    cx: &UnitCtx,
-    requests: &mut Vec<Request>,
-    unit_menu: &mut dyn FnMut(&mut Ui),
-) {
-    // Handed to the first line drawn; every other line gets an empty slot.
-    let mut unit_menu: Option<&mut dyn FnMut(&mut Ui)> = Some(unit_menu);
-    let Some(status) = cx.status else {
-        let hosts: Vec<String> = cfg.servers.iter().map(|s| format!("{} on {}", s.role, s.host)).collect();
-        let text = if cx.checking {
-            format!("Checking {}…", hosts.join(", "))
-        } else {
-            format!("Status of {} not checked. Refresh to try again.", hosts.join(", "))
-        };
-        line_with_menu(ui, theme::caption(text), &mut unit_menu);
-        return;
-    };
     let unit_hosts: BTreeSet<&str> = cfg.servers.iter().map(|s| s.host.as_str()).collect();
     let unreachable = status.hosts.iter().filter(|h| !h.ok && unit_hosts.contains(h.host.as_str())).count();
-    let all_unreachable = !unit_hosts.is_empty() && unreachable == unit_hosts.len();
-
-    let running: Vec<(&str, &Container)> = status
+    let running = status
         .hosts
         .iter()
         .flat_map(|h| {
@@ -719,7 +644,7 @@ fn containers(
                 .map(move |c| (h.host.as_str(), c))
         })
         .collect();
-    let accessories: Vec<(&str, &str, Option<&Container>)> = cfg
+    let accessories = cfg
         .accessories
         .iter()
         .flat_map(|a| {
@@ -736,16 +661,196 @@ fn containers(
             if found.is_empty() { vec![(a.name.as_str(), "", None)] } else { found }
         })
         .collect();
+    Live { status, running, accessories, all_unreachable: !unit_hosts.is_empty() && unreachable == unit_hosts.len() }
+}
 
-    if running.is_empty() {
-        let text = if all_unreachable {
-            let hosts: Vec<&str> = unit_hosts.iter().copied().collect();
-            format!("Status unknown  ·  can't reach {}", hosts.join(", "))
+/// "latest" / "3 behind" for a running version, its color and a compare link.
+fn freshness(
+    p: &Palette,
+    cx: &UnitCtx,
+    status: &ProjectStatus,
+    c: &Container,
+) -> Option<(String, egui::Color32, Option<String>)> {
+    let sha = c.version.split('_').next().unwrap_or(&c.version);
+    match status.versions.get(&c.version).and_then(|i| i.behind) {
+        Some(0) => Some(("latest".to_string(), p.ok, None)),
+        // What's on the default branch but not on the server.
+        Some(n) => Some((
+            format!("{n} behind"),
+            p.warn,
+            cx.repo.as_ref().map(|r| format!("{r}/compare/{sha}...{}", cx.branch)),
+        )),
+        None => None,
+    }
+}
+
+/// Every text in a service's block has this size; weight and color set
+/// what matters, so all lines share one baseline.
+const T: f32 = 13.5;
+/// Every other row of a block is tinted.
+const STRIPE: egui::Color32 = egui::Color32::from_rgb(0xf7, 0xf7, 0xf8);
+
+fn muted(p: &Palette, s: impl Into<String>) -> RichText {
+    RichText::new(s).size(T).color(p.muted)
+}
+
+/// Rows of one block, counted so every other one is tinted and the last
+/// one gets the block's rounded corners.
+struct Stripes {
+    next: usize,
+    total: usize,
+}
+
+fn striped<R>(ui: &mut Ui, stripes: &mut Stripes, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let i = stripes.next;
+    stripes.next += 1;
+    let corners = if i + 1 >= stripes.total {
+        egui::CornerRadius { nw: 0, ne: 0, sw: 7, se: 7 }
+    } else {
+        egui::CornerRadius::ZERO
+    };
+    egui::Frame::new()
+        .fill(if i % 2 == 1 { STRIPE } else { egui::Color32::TRANSPARENT })
+        .corner_radius(corners)
+        .inner_margin(egui::Margin { left: 14, right: 8, top: 0, bottom: 0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.set_min_height(34.0);
+                add(ui)
+            })
+            .inner
+        })
+        .inner
+}
+
+/// A link in a block row, the same size as the text around it.
+fn row_link(ui: &mut Ui, text: &str) -> egui::Response {
+    let r = ui
+        .add(egui::Label::new(RichText::new(text).size(T).color(theme::ACCENT)).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if r.hovered() {
+        ui.painter().hline(r.rect.x_range(), r.rect.bottom(), egui::Stroke::new(1.0, theme::ACCENT));
+    }
+    r
+}
+
+/// One service as a block: a header with what applies to the whole service
+/// (name, config file, how current it is, its actions), then a row per
+/// container and accessory, then its base image.
+fn unit_rows(ui: &mut Ui, p: &Palette, unit: &Unit, cx: &UnitCtx, requests: &mut Vec<Request>) {
+    let service = unit.config.service.clone().unwrap_or_else(|| "(no service)".into());
+    let live = cx.status.map(|s| live(unit, s));
+    egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(1).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 8, top: 9, bottom: 9 }).show(ui, |ui| {
+                unit_header(ui, p, unit, cx, &service, live.as_ref(), requests);
+            });
+            let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter().rect_filled(line, 0.0, p.border);
+            let total = match &live {
+                None => 1,
+                Some(l) => usize::from(l.running.is_empty()) + l.running.len() + l.accessories.len(),
+            } + usize::from(unit.base_image.is_some());
+            let mut stripes = Stripes { next: 0, total };
+            containers(ui, p, unit, cx, live.as_ref(), &mut stripes, requests);
+            image_line(ui, p, &mut stripes, unit, cx.status);
+        },
+    );
+    ui.add_space(10.0);
+}
+
+fn unit_header(
+    ui: &mut Ui,
+    p: &Palette,
+    unit: &Unit,
+    cx: &UnitCtx,
+    service: &str,
+    live: Option<&Live>,
+    requests: &mut Vec<Request>,
+) {
+    let file = unit.config_file.trim_start_matches("config/");
+    let about = match &unit.destination {
+        Some(d) => format!("{}  ·  {file} -d {d}", kind_label(&unit.kind)),
+        None => format!("{}  ·  {file}", kind_label(&unit.kind)),
+    };
+    let first = live.and_then(|l| l.running.first());
+    let deployed = live.and_then(|l| l.running.iter().filter_map(|(_, c)| c.created_ms()).max());
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let mut menu_requests = Vec::new();
+            unit_menu(ui, unit, cx, service, &mut menu_requests);
+            requests.extend(menu_requests);
+            if cx.deploying {
+                ui.label(RichText::new("Deploying…").size(T).color(theme::ACCENT));
+                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+            } else {
+                if let Some(t) = deployed {
+                    ui.label(muted(p, format!("deployed {}", theme::ago(t)))).on_hover_text(theme::date_time(t));
+                }
+                if let (Some((_, c)), Some(status)) = (first, cx.status)
+                    && let Some((text, color, url)) = freshness(p, cx, status, c)
+                {
+                    let fill = if color == p.ok { p.ok_soft } else { p.warn_soft };
+                    theme::pill(ui, &text, color, fill, url.as_deref());
+                }
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new(service).family(theme::medium()).size(T));
+                ui.add(egui::Label::new(muted(p, about)).truncate());
+            });
+        });
+    });
+}
+
+/// Width every row reserves on the right for a ⋯ menu.
+const MENU_SLOT: f32 = 28.0;
+/// Fixed columns, so rows line up within and across services.
+const ROLE_COL: f32 = 120.0;
+const VERSION_COL: f32 = 72.0;
+const HOST_COL: f32 = 96.0;
+const STATE_COL: f32 = 150.0;
+
+/// A cell of fixed width; its content truncates.
+fn cell(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui)) {
+    ui.allocate_ui_with_layout(vec2(width, 22.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_width(width);
+        add(ui);
+    });
+}
+
+fn containers(
+    ui: &mut Ui,
+    p: &Palette,
+    unit: &Unit,
+    cx: &UnitCtx,
+    live: Option<&Live>,
+    stripes: &mut Stripes,
+    requests: &mut Vec<Request>,
+) {
+    let cfg = &unit.config;
+    let Some(live) = live else {
+        let hosts: Vec<String> = cfg.servers.iter().map(|s| format!("{} on {}", s.role, s.host)).collect();
+        let text = if cx.checking {
+            format!("Checking {}…", hosts.join(", "))
+        } else {
+            format!("Status of {} not checked. Refresh to try again.", hosts.join(", "))
+        };
+        message_row(ui, p, stripes, text);
+        return;
+    };
+    let status = live.status;
+    if live.running.is_empty() {
+        let text = if live.all_unreachable {
+            let hosts: BTreeSet<&str> = cfg.servers.iter().map(|s| s.host.as_str()).collect();
+            format!("Status unknown  ·  can't reach {}", hosts.into_iter().collect::<Vec<_>>().join(", "))
         } else {
             "Not running".to_string()
         };
-        line_with_menu(ui, RichText::new(text).color(p.muted), &mut unit_menu);
-        ui.add_space(6.0);
+        message_row(ui, p, stripes, text);
         // Fall through: accessories still get their rows (and Boot).
     }
 
@@ -759,80 +864,56 @@ fn containers(
         }));
     };
 
-    for (host, c) in &running {
-        let info = status.versions.get(&c.version);
+    for (host, c) in &live.running {
         let sha = c.version.split('_').next().unwrap_or(&c.version);
-        let freshness = match info.and_then(|i| i.behind) {
-            Some(0) => Some(("latest".to_string(), p.ok, None)),
-            // What's on the default branch but not on the server.
-            Some(n) => Some((
-                format!("{n} behind"),
-                p.warn,
-                cx.repo.as_ref().map(|r| format!("{r}/compare/{sha}...{}", cx.branch)),
-            )),
-            None => None,
-        };
-        let open = container_block(
+        let click = container_row(
             ui,
             p,
+            stripes,
             ContainerLine {
                 dot: p.ok,
                 name: c.role.as_deref().unwrap_or("app"),
-                hover: &c.name,
+                hover: c.name.clone(),
                 version: Some(&c.version),
                 version_url: cx.repo.as_ref().map(|r| format!("{r}/commit/{sha}")),
-                note: info.and_then(|i| i.subject.as_deref()).unwrap_or(""),
-                freshness,
+                note: status.versions.get(&c.version).and_then(|i| i.subject.clone()).unwrap_or_default(),
                 host,
-                deployed: docker_time_ms(&c.created),
-                detail: &c.status,
+                state: c.status.clone(),
                 logs: true,
                 accessory: None,
             },
-            unit_menu.take(),
         );
-        if open.logs {
+        if click.logs {
             logs(requests, host, c);
         }
     }
-    for (name, host, c) in &accessories {
+    for (name, host, c) in &live.accessories {
         let (exists, running) = match c {
             Some(c) => (true, c.state == "running"),
             None => (false, false),
         };
-        let menu =
-            Some(AccessoryMenu { exists: exists || all_unreachable, running, busy: cx.busy, unknown: all_unreachable });
-        let line = match c {
-            Some(c) => ContainerLine {
-                dot: if running { p.ok } else { p.bad },
-                name,
-                hover: &c.name,
-                version: None,
-                version_url: None,
-                note: "accessory",
-                freshness: None,
-                host,
-                deployed: None,
-                detail: &c.status,
-                logs: true,
-                accessory: menu,
+        let unknown = live.all_unreachable;
+        let line = ContainerLine {
+            dot: match c {
+                Some(_) if running => p.ok,
+                Some(_) => p.bad,
+                None => p.border,
             },
-            None => ContainerLine {
-                dot: p.border,
-                name,
-                hover: "",
-                version: None,
-                version_url: None,
-                note: "accessory",
-                freshness: None,
-                host: "",
-                deployed: None,
-                detail: if all_unreachable { "status unknown" } else { "not running" },
-                logs: false,
-                accessory: menu,
+            name,
+            hover: c.map(|c| c.name.clone()).unwrap_or_default(),
+            version: None,
+            version_url: None,
+            note: "accessory".into(),
+            host,
+            state: match c {
+                Some(c) => c.status.clone(),
+                None if unknown => "status unknown".into(),
+                None => "not running".into(),
             },
+            logs: c.is_some(),
+            accessory: Some(AccessoryMenu { exists: exists || unknown, running, busy: cx.busy, unknown }),
         };
-        let click = container_block(ui, p, line, None);
+        let click = container_row(ui, p, stripes, line);
         if click.logs
             && let Some(c) = c
         {
@@ -850,6 +931,13 @@ fn containers(
             }));
         }
     }
+}
+
+/// A row with only a grey message ("Not running", "Checking…").
+fn message_row(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, text: String) {
+    striped(ui, stripes, |ui| {
+        ui.add(egui::Label::new(muted(p, text)).truncate());
+    });
 }
 
 /// What a container line's accessory menu may offer.
@@ -917,46 +1005,34 @@ fn accessory_request(unit: &Unit, cx: &UnitCtx, name: &str, verb: AccessoryVerb)
 
 struct ContainerLine<'a> {
     dot: egui::Color32,
-    /// Role (web, scheduler…) or accessory name.
+    /// Role (web, job…) or accessory name.
     name: &'a str,
-    hover: &'a str,
+    hover: String,
     version: Option<&'a str>,
     version_url: Option<String>,
     /// Commit subject, or "accessory".
-    note: &'a str,
-    /// "latest" / "3 behind", its color and an optional compare link.
-    freshness: Option<(String, egui::Color32, Option<String>)>,
-    /// Host and uptime, shown underneath in grey.
+    note: String,
     /// Where it runs.
     host: &'a str,
-    /// When the container was created: by the deploy (or boot) that started
-    /// this version, whether it ran from here or from the kamal CLI.
-    deployed: Option<i64>,
     /// Docker's state, e.g. "Up 2 hours (healthy)".
-    detail: &'a str,
+    state: String,
     logs: bool,
     /// Accessories get their own actions menu.
     accessory: Option<AccessoryMenu>,
 }
 
-/// One container as two lines: what runs (with actions on the right), then
-/// where and for how long.
-fn container_block(
-    ui: &mut Ui,
-    p: &Palette,
-    line: ContainerLine,
-    unit_menu: Option<&mut dyn FnMut(&mut Ui)>,
-) -> BlockClick {
+/// One container in a service's block: role or accessory, version and
+/// commit, host and state in fixed columns, then Logs and actions.
+fn container_row(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, line: ContainerLine) -> BlockClick {
     let mut click = BlockClick::default();
-    ui.spacing_mut().item_spacing.y = 2.0;
-    ui.horizontal(|ui| {
+    striped(ui, stripes, |ui| {
         // Right side first so the commit subject can truncate to what's left.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if line.accessory.is_none() {
-                trailing_slot(ui, unit_menu);
-            }
-            if let Some(menu) = &line.accessory {
-                theme::more_menu(ui, &format!("Actions for {}", line.name), |ui| {
+            match &line.accessory {
+                None => {
+                    ui.allocate_exact_size(vec2(MENU_SLOT, 22.0), egui::Sense::hover());
+                }
+                Some(menu) => theme::more_menu(ui, &format!("Actions for {}", line.name), |ui| {
                     if menu.busy {
                         ui.label(theme::caption("A run is in progress. Actions are available when it finishes."));
                         ui.separator();
@@ -984,54 +1060,50 @@ fn container_block(
                             ui.close();
                         }
                     });
-                });
+                }),
             }
-            if line.logs && theme::link(ui, "Logs").clicked() {
-                click.logs = true;
-            }
-            if let Some((text, color, url)) = &line.freshness {
-                theme::subtle_link(ui, RichText::new(text).size(12.5).color(*color), url.as_deref());
-            }
+            ui.allocate_ui_with_layout(vec2(36.0, 22.0), Layout::right_to_left(Align::Center), |ui| {
+                ui.set_width(36.0);
+                if line.logs && row_link(ui, "Logs").clicked() {
+                    click.logs = true;
+                }
+            });
+            let muted = |s: &str| muted(p, s);
+            ui.allocate_ui_with_layout(vec2(STATE_COL, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(STATE_COL);
+                ui.add(egui::Label::new(muted(&line.state)).truncate());
+            });
+            ui.allocate_ui_with_layout(vec2(HOST_COL, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(HOST_COL);
+                ui.add(egui::Label::new(muted(line.host)).truncate());
+            });
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                theme::dot(ui, line.dot);
-                let name = ui.label(RichText::new(line.name).family(theme::medium()));
-                if !line.hover.is_empty() {
-                    name.on_hover_text(line.hover);
+                cell(ui, ROLE_COL, |ui| {
+                    theme::dot(ui, line.dot);
+                    let name = ui.add(egui::Label::new(RichText::new(line.name).size(T)).truncate());
+                    if !line.hover.is_empty() {
+                        name.on_hover_text(&line.hover);
+                    }
+                });
+                cell(ui, VERSION_COL, |ui| match line.version {
+                    Some(v) => {
+                        theme::subtle_link(
+                            ui,
+                            RichText::new(theme::short_version(v)).size(T),
+                            line.version_url.as_deref(),
+                        );
+                    }
+                    None => {
+                        ui.label(muted(&line.note));
+                    }
+                });
+                if line.version.is_some() {
+                    ui.add(egui::Label::new(muted(&line.note)).truncate());
                 }
-                if let Some(v) = line.version {
-                    theme::subtle_link(
-                        ui,
-                        RichText::new(theme::short_version(v)).monospace(),
-                        line.version_url.as_deref(),
-                    );
-                }
-                ui.add(egui::Label::new(theme::caption(line.note)).truncate());
             });
         });
     });
-    ui.horizontal(|ui| {
-        ui.add_space(18.0);
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let muted = |s: String| RichText::new(s).size(12.0).color(p.muted);
-        let sep = "  ·  ";
-        if !line.host.is_empty() {
-            ui.label(muted(format!("{}{sep}", line.host)));
-        }
-        if let Some(t) = line.deployed {
-            ui.label(muted(format!("Deployed {}", theme::ago(t)))).on_hover_text(theme::date_time(t));
-            ui.label(muted(sep.into()));
-        }
-        ui.label(muted(line.detail.to_string()));
-    });
-    ui.add_space(10.0);
     click
-}
-
-/// Docker's `CreatedAt` (`2026-11-18 20:20:13 +0100 CET`) as Unix ms.
-fn docker_time_ms(s: &str) -> Option<i64> {
-    let mut parts = s.split_whitespace();
-    let stamp = format!("{} {} {}", parts.next()?, parts.next()?, parts.next()?);
-    chrono::DateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S %z").ok().map(|d| d.timestamp_millis())
 }
 
 fn unit_menu(ui: &mut Ui, unit: &Unit, cx: &UnitCtx, service: &str, requests: &mut Vec<Request>) {
@@ -1243,46 +1315,45 @@ fn unit_menu_items(
 
 /// The external image this unit builds on, which release of it is running and
 /// whether a newer one is out.
-fn base_image_line(ui: &mut Ui, p: &Palette, unit: &Unit, status: Option<&ProjectStatus>) {
+/// The service's base image and how the running version compares with the
+/// newest upstream release.
+fn image_line(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, unit: &Unit, status: Option<&ProjectStatus>) {
     let Some(base) = &unit.base_image else { return };
     let mut running: Vec<(String, Option<String>)> = Vec::new();
-    if let Some(status) = status {
-        for c in
-            status.hosts.iter().flat_map(|h| &h.containers).filter(|c| own_container(unit, c) && c.state == "running")
-        {
-            if let Some(v) = &c.image_version {
-                let entry = (images::release_of(v).to_string(), c.image_source.clone());
-                if !running.contains(&entry) {
-                    running.push(entry);
-                }
+    let containers = status.into_iter().flat_map(|s| &s.hosts).flat_map(|h| &h.containers);
+    for c in containers.filter(|c| own_container(unit, c) && c.state == "running") {
+        if let Some(v) = &c.image_version {
+            let entry = (images::release_of(v).to_string(), c.image_source.clone());
+            if !running.contains(&entry) {
+                running.push(entry);
             }
         }
     }
-    ui.horizontal_wrapped(|ui| {
+    striped(ui, stripes, |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let kind = if images::is_pinned(base) {
             "Pinned to this version."
         } else {
             "Floating tag: each deploy builds on whatever was last published under it."
         };
-        ui.label(theme::caption("Image")).on_hover_text(kind);
-        ui.label(RichText::new(base).monospace().size(12.0).color(p.muted)).on_hover_text(kind);
+        ui.label(muted(p, "Image")).on_hover_text(kind);
+        ui.label(RichText::new(base).size(T)).on_hover_text(kind);
         for (version, source) in &running {
             let latest = source.as_ref().and_then(|s| status.and_then(|st| st.releases.get(s)));
             match latest {
                 Some(r) if r.tag == *version => {
-                    ui.label(theme::caption(format!("· {version}")));
-                    ui.label(RichText::new("latest").size(12.5).color(p.ok));
+                    ui.label(muted(p, version));
+                    ui.label(RichText::new("latest").size(T).color(p.ok));
                 }
                 Some(r) => {
                     let date = r.published_at.get(..10).unwrap_or(&r.published_at);
-                    ui.label(theme::caption(format!("· {version} →")));
-                    ui.label(RichText::new(format!("{} available", r.tag)).size(12.5).color(p.warn))
+                    ui.label(muted(p, format!("{version} →")));
+                    ui.label(RichText::new(format!("{} available", r.tag)).size(T).color(p.warn))
                         .on_hover_text(format!("Released {date}. Deploy to pick it up."));
-                    ui.hyperlink_to(RichText::new("Release notes").size(12.5).color(theme::ACCENT), &r.url);
+                    ui.hyperlink_to(RichText::new("Release notes").size(T).color(theme::ACCENT), &r.url);
                 }
                 None => {
-                    ui.label(theme::caption(format!("· {version}")));
+                    ui.label(muted(p, version));
                 }
             }
         }
@@ -1375,19 +1446,5 @@ mod bench {
         }
         let targets = view.detail.as_ref().map(|d| d.targets.len()).unwrap_or(0);
         println!("{name}: {targets} targets  steady frame {:?}", t.elapsed() / n);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_docker_created_at() {
-        let ms = docker_time_ms("2026-11-18 20:20:13 +0100 CET").unwrap();
-        assert_eq!(ms, 1_795_029_613_000);
-        assert_eq!(docker_time_ms("2026-11-18 19:20:13 +0000 UTC"), Some(ms));
-        assert_eq!(docker_time_ms("About an hour ago"), None);
-        assert_eq!(docker_time_ms(""), None);
     }
 }
