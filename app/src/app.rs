@@ -255,22 +255,8 @@ impl KamalApp {
                     let selected = self.settings.is_none() && self.current.as_deref() == Some(proj.name.as_str());
                     let busy = running.contains(&proj.name);
                     let deployed = self.last_deploy.get(&proj.name).copied();
-                    let r = ui.selectable_label(selected, &proj.name);
-                    if busy {
-                        let rect = egui::Rect::from_center_size(
-                            egui::pos2(r.rect.right() - 14.0, r.rect.center().y),
-                            egui::vec2(14.0, 14.0),
-                        );
-                        egui::Spinner::new().color(theme::ACCENT).paint_at(ui, rect);
-                    } else if let Some(t) = deployed.filter(|_| self.sort == ProjectSort::LastDeploy) {
-                        ui.painter().text(
-                            egui::pos2(r.rect.right() - 8.0, r.rect.center().y),
-                            egui::Align2::RIGHT_CENTER,
-                            theme::ago_short(t),
-                            egui::FontId::proportional(12.0),
-                            p.muted,
-                        );
-                    }
+                    let age = deployed.filter(|_| self.sort == ProjectSort::LastDeploy).map(theme::ago_short);
+                    let r = project_row(ui, &proj.name, selected, busy, age.as_deref(), p.muted);
                     let mut hover = proj.url.clone();
                     if let Some(t) = deployed {
                         hover += &format!("\nDeployed {} ({})", theme::ago(t), theme::date_time_short(t));
@@ -632,6 +618,53 @@ fn save_ui_state(state: &UiState) {
     if let Ok(text) = serde_json::to_string(state) {
         let _ = std::fs::write(ui_state_path(), text);
     }
+}
+
+/// A project in the sidebar: its name, wrapped to leave room on the right
+/// for a spinner (a run is in progress) or how long ago it was deployed.
+fn project_row(
+    ui: &mut Ui,
+    name: &str,
+    selected: bool,
+    busy: bool,
+    age: Option<&str>,
+    muted: egui::Color32,
+) -> egui::Response {
+    let pad = egui::vec2(11.0, 5.0);
+    let width = ui.available_width();
+    let painter = ui.painter().clone();
+    let age =
+        age.filter(|_| !busy).map(|a| painter.layout_no_wrap(a.to_string(), egui::FontId::proportional(12.0), muted));
+    let right = if busy { 22.0 } else { age.as_ref().map_or(0.0, |g| g.size().x + 10.0) };
+    let text = painter.layout(
+        name.to_string(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        theme::TEXT,
+        (width - 2.0 * pad.x - right).max(40.0),
+    );
+    let height = (text.size().y + 2.0 * pad.y).max(ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        Some(visuals.selection.bg_fill)
+    } else if resp.hovered() {
+        Some(visuals.widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        painter.rect_filled(rect, 7, fill);
+    }
+    let first_line = rect.top() + pad.y + text.rows.first().map_or(text.size().y, |r| r.height()) / 2.0;
+    painter.galley(rect.min + pad, text, theme::TEXT);
+    if busy {
+        let spinner = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, first_line), egui::vec2(14.0, 14.0));
+        egui::Spinner::new().color(theme::ACCENT).paint_at(ui, spinner);
+    } else if let Some(age) = age {
+        let pos = egui::pos2(rect.right() - pad.x + 3.0 - age.size().x, first_line - age.size().y / 2.0);
+        painter.galley(pos, age, muted);
+    }
+    resp
 }
 
 fn note_deploy(map: &mut std::collections::HashMap<String, i64>, project: &str, at: i64) {
