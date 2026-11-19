@@ -55,6 +55,16 @@ pub struct Session {
     pub replay: bool,
     /// The screen of an interactive session (`Kind::Terminal`).
     terminal: Option<Terminal>,
+    /// Selected output: where the drag started and where it is now.
+    selection: Option<(Pos, Pos)>,
+}
+
+/// A place in the output: a line (counted from the very first one, so it
+/// survives old lines being dropped) and a character in its plain text.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Pos {
+    line: u64,
+    col: usize,
 }
 
 /// Where each visible output line sits. Built incrementally as lines arrive,
@@ -116,6 +126,7 @@ impl Session {
             queued: false,
             replay: false,
             terminal: None,
+            selection: None,
         }
     }
 
@@ -145,6 +156,25 @@ impl Session {
             self.widths.drain(..drop);
             self.dropped += drop as u64;
         }
+    }
+
+    /// The selected text, one output line per line, in the order shown (so
+    /// only lines that match the filter).
+    fn selected_text(&self, (a, b): (Pos, Pos)) -> String {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let Some(rows) = &self.rows else { return String::new() };
+        let mut out = Vec::new();
+        for &i in &rows.lines {
+            let abs = self.dropped + i as u64;
+            if abs < a.line || abs > b.line {
+                continue;
+            }
+            let text = plain(&self.lines[i as usize].1);
+            let from = if abs == a.line { a.col } else { 0 };
+            let to = if abs == b.line { b.col } else { usize::MAX };
+            out.push(text.chars().skip(from).take(to.saturating_sub(from)).collect::<String>());
+        }
+        out.join("\n")
     }
 
     fn update_rows(&mut self, filter: &str, cols: usize, row_height: f32) -> &Rows {
@@ -421,42 +451,173 @@ impl Console {
         }
         let font = FontId::monospace(12.5);
         let (row_height, char_width) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
+        // A filter change reorders what's shown: start the selection over.
+        if s.rows.as_ref().is_some_and(|r| r.filter != filter) {
+            s.selection = None;
+        }
+        let mut selection = s.selection;
+        let mut copy: Option<String> = None;
 
         // Only the lines inside the viewport are laid out and drawn; the rest
-        // are just numbers in `Rows`.
+        // are just numbers in `Rows`. While something is selected the view
+        // stops following new output, so the selection stays put.
         ScrollArea::vertical()
             .id_salt(("console-output", &s.key))
             .auto_shrink(false)
-            .stick_to_bottom(true)
+            .stick_to_bottom(selection.is_none())
             .show_viewport(ui, |ui, viewport| {
                 let width = ui.available_width().max(char_width * 20.0);
                 let cols = ((width / char_width).floor() as usize).max(1);
                 s.update_rows(&filter, cols, row_height);
+                let s = &*s;
                 let rows = s.rows.as_ref().unwrap();
                 let total = *rows.tops.last().unwrap();
                 ui.set_height(total);
                 let origin = ui.max_rect().min;
+                let galley_of = |r: usize| {
+                    let (stream, line) = &s.lines[rows.lines[r] as usize];
+                    let mut job = ansi::layout(line, line_color(*stream, line), font.clone());
+                    job.wrap.max_width = width;
+                    job.wrap.break_anywhere = true;
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+                // Pointer position → place in the output.
+                let hit = |pos: egui::Pos2| -> Option<Pos> {
+                    if rows.lines.is_empty() {
+                        return None;
+                    }
+                    let y = (pos.y - origin.y).clamp(0.0, (total - 1.0).max(0.0));
+                    let r = rows.tops.partition_point(|&t| t <= y).saturating_sub(1).min(rows.lines.len() - 1);
+                    let galley = galley_of(r);
+                    let local = pos - (origin + egui::vec2(0.0, rows.tops[r]));
+                    let col = if pos.y - origin.y >= total {
+                        galley.text().chars().count()
+                    } else {
+                        galley.cursor_from_pos(local).index.0
+                    };
+                    Some(Pos { line: s.dropped + rows.lines[r] as u64, col })
+                };
+
+                let visible = egui::Rect::from_min_size(origin + viewport.min.to_vec2(), viewport.size());
+                let resp = ui.interact(visible, ui.scope_id().with("select"), egui::Sense::click_and_drag());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::Text);
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(p) = ui.input(|i| i.pointer.press_origin()).and_then(hit)
+                {
+                    selection = Some((p, p));
+                    resp.request_focus();
+                }
+                if resp.dragged_by(egui::PointerButton::Primary)
+                    && let Some(ptr) = resp.interact_pointer_pos()
+                {
+                    if let (Some((anchor, _)), Some(p)) = (selection, hit(ptr)) {
+                        selection = Some((anchor, p));
+                    }
+                    // Past the top or bottom edge: scroll, faster the further out.
+                    let out = if ptr.y < visible.top() {
+                        visible.top() - ptr.y
+                    } else if ptr.y > visible.bottom() {
+                        visible.bottom() - ptr.y
+                    } else {
+                        0.0
+                    };
+                    if out != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, out.clamp(-48.0, 48.0) * 0.7));
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if resp.clicked_by(egui::PointerButton::Primary) {
+                    selection = None;
+                    resp.request_focus();
+                }
+                let all = || {
+                    let first = *rows.lines.first()?;
+                    let last = *rows.lines.last()?;
+                    let end = plain(&s.lines[last as usize].1).chars().count();
+                    Some((
+                        Pos { line: s.dropped + first as u64, col: 0 },
+                        Pos { line: s.dropped + last as u64, col: end },
+                    ))
+                };
+                resp.context_menu(|ui| {
+                    if ui.add_enabled(selection.is_some_and(|(a, b)| a != b), egui::Button::new("Copy")).clicked() {
+                        copy = selection.map(|sel| s.selected_text(sel));
+                        ui.close();
+                    }
+                    if ui.button("Select all").clicked() {
+                        selection = all();
+                        ui.close();
+                    }
+                    if ui.add_enabled(selection.is_some(), egui::Button::new("Clear selection")).clicked() {
+                        selection = None;
+                        ui.close();
+                    }
+                });
+                if resp.has_focus() {
+                    ui.input(|i| {
+                        for e in &i.events {
+                            match e {
+                                egui::Event::Copy => {
+                                    if let Some(sel) = selection.filter(|(a, b)| a != b) {
+                                        copy = Some(s.selected_text(sel));
+                                    }
+                                }
+                                egui::Event::Key { key: egui::Key::A, pressed: true, modifiers, .. }
+                                    if modifiers.command =>
+                                {
+                                    selection = all();
+                                }
+                                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => selection = None,
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+
+                let sel = selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) }).filter(|(a, b)| a != b);
                 let first = rows.tops.partition_point(|&t| t <= viewport.min.y).saturating_sub(1);
                 for r in first..rows.lines.len() {
                     let top = rows.tops[r];
                     if top > viewport.max.y {
                         break;
                     }
-                    let (stream, line) = &s.lines[rows.lines[r] as usize];
-                    let mut job = ansi::layout(line, line_color(*stream, line), font.clone());
-                    job.wrap.max_width = width;
-                    job.wrap.break_anywhere = true;
-                    let galley = ui.fonts_mut(|f| f.layout_job(job));
-                    let rect = egui::Rect::from_min_size(
-                        origin + egui::vec2(0.0, top),
-                        egui::vec2(width, rows.tops[r + 1] - top),
-                    );
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        ui.add(egui::Label::new(galley));
-                    });
+                    let galley = galley_of(r);
+                    let at = origin + egui::vec2(0.0, top);
+                    let abs = s.dropped + rows.lines[r] as u64;
+                    if let Some((a, b)) = sel.filter(|(a, b)| a.line <= abs && abs <= b.line) {
+                        let n = galley.text().chars().count();
+                        let from = if abs == a.line { a.col } else { 0 };
+                        let to = if abs == b.line { b.col.min(n) } else { n };
+                        for i in from..to {
+                            let c = galley.pos_from_cursor(egui::text::CCursor::new(i));
+                            let cell =
+                                egui::Rect::from_min_size(at + c.min.to_vec2(), egui::vec2(char_width, c.height()));
+                            ui.painter().rect_filled(cell, 0.0, SELECTION);
+                        }
+                        // A selection that goes on to the next line covers the line end too.
+                        if abs < b.line {
+                            let c = galley.pos_from_cursor(egui::text::CCursor::new(n));
+                            let cell =
+                                egui::Rect::from_min_size(at + c.min.to_vec2(), egui::vec2(char_width, c.height()));
+                            ui.painter().rect_filled(cell, 0.0, SELECTION);
+                        }
+                    }
+                    ui.painter().galley(at, galley, TEXT);
                 }
             });
+        s.selection = selection;
+        if let Some(text) = copy.filter(|t| !t.is_empty()) {
+            ui.ctx().copy_text(text);
+        }
     }
+}
+
+/// Selected output's background.
+const SELECTION: Color32 = Color32::from_rgb(0x2f, 0x45, 0x6b);
+
+/// A line's text without ANSI escapes, as laid out (what selections count in).
+fn plain(line: &str) -> String {
+    ansi::layout(line, TEXT, FontId::monospace(12.5)).text
 }
 
 /// Base color for a line: the app's own messages in blue; kamal's log levels
@@ -503,7 +664,7 @@ fn tab(ui: &mut Ui, title: &str, status: Status, active: bool) -> TabClick {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 theme::dot(ui, status_dot(status));
                 let text = RichText::new(title).color(if active { Color32::WHITE } else { DIM });
-                if ui.add(egui::Label::new(text).sense(egui::Sense::click())).clicked() {
+                if ui.add(egui::Label::new(text).selectable(false).sense(egui::Sense::click())).clicked() {
                     click = TabClick::Select;
                 }
                 let (rect, x) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
@@ -620,5 +781,112 @@ mod bench {
             frame(&mut console);
         }
         println!("  with filter: steady frame {:?}", t.elapsed() / n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(lines: &[&str]) -> Session {
+        let mut s = Session::new("run:1".into(), "t".into(), Kind::Run, None);
+        s.set_lines(lines.iter().map(|l| (Stream::Out, l.to_string())).collect());
+        s
+    }
+
+    #[test]
+    fn copies_the_selected_part_of_each_line() {
+        let mut s = session(&["first line", "\x1b[31msecond\x1b[0m line", "third line"]);
+        s.update_rows("", 80, 16.0);
+        let sel = (Pos { line: 0, col: 6 }, Pos { line: 2, col: 5 });
+        assert_eq!(s.selected_text(sel), "line\nsecond line\nthird");
+        // Dragging upwards selects the same.
+        assert_eq!(s.selected_text((sel.1, sel.0)), "line\nsecond line\nthird");
+    }
+
+    #[test]
+    fn copies_only_what_the_filter_shows() {
+        let mut s = session(&["ERROR one", "info two", "ERROR three"]);
+        s.update_rows("error", 80, 16.0);
+        let sel = (Pos { line: 0, col: 0 }, Pos { line: 2, col: 11 });
+        assert_eq!(s.selected_text(sel), "ERROR one\nERROR three");
+    }
+
+    #[test]
+    fn selection_counts_lines_from_the_very_first() {
+        let mut s = session(&["a"; MAX_LINES]);
+        s.append([(Stream::Out, "last".to_string())]);
+        assert_eq!(s.dropped, 1);
+        s.update_rows("", 80, 16.0);
+        let last = MAX_LINES as u64;
+        assert_eq!(s.selected_text((Pos { line: last, col: 0 }, Pos { line: last, col: 4 })), "last");
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, vec2};
+    use std::sync::{Arc, mpsc};
+
+    /// Dragging selects; holding the pointer above the output scrolls up and
+    /// extends the selection; Cmd+C copies it.
+    #[test]
+    fn drag_selects_scrolls_and_copies() {
+        let lines: Vec<(Stream, String)> = (0..300).map(|i| (Stream::Out, format!("line {i:03}"))).collect();
+        let mut console = Console::default();
+        let mut s = Session::new("k".into(), "t".into(), Kind::Run, Some("p".into()));
+        s.set_lines(lines);
+        s.status = Status::Ok;
+        console.open(s);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let runner = Runner::new(mpsc::channel().0, Arc::new(|| {}));
+        let mut copied = Vec::new();
+        let mut frame = |console: &mut Console, events: Vec<Event>| {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| console.ui(ui, &runner, Some("p")));
+            out.textures_delta.clear();
+            for c in out.platform_output.commands {
+                if let egui::OutputCommand::CopyText(t) = c {
+                    copied.push(t);
+                }
+            }
+        };
+        let press = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for _ in 0..3 {
+            frame(&mut console, vec![]);
+        }
+        let (from, to) = (Pos2::new(60.0, 300.0), Pos2::new(120.0, 360.0));
+        frame(&mut console, vec![Event::PointerMoved(from), press(from, true)]);
+        for i in 1..=5 {
+            frame(&mut console, vec![Event::PointerMoved(from + (to - from) * (i as f32 / 5.0))]);
+        }
+        let sel = console.sessions[0].selection.expect("dragging selects");
+        assert!(sel.0 != sel.1);
+        let start = sel.0.min(sel.1).line;
+
+        // Above the output: it scrolls up and the selection follows.
+        let above = Pos2::new(60.0, 5.0);
+        for _ in 0..30 {
+            frame(&mut console, vec![Event::PointerMoved(above)]);
+        }
+        frame(&mut console, vec![press(above, false)]);
+        let sel = console.sessions[0].selection.unwrap();
+        assert!(sel.0.min(sel.1).line < start, "scrolled up while dragging: {start} → {:?}", sel);
+
+        frame(&mut console, vec![Event::Copy]);
+        let text = copied.last().expect("Cmd+C copies");
+        // The first line is cut where the drag ended (mid-line); the rest are whole.
+        assert!(text.lines().count() > 3 && text.lines().skip(1).all(|l| l.starts_with("line ")), "{text}");
     }
 }
