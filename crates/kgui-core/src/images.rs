@@ -190,13 +190,78 @@ const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json";
 
+/// Whether an address is on the public internet (not loopback, private,
+/// link-local, CGNAT, multicast, documentation or unspecified).
+fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// `host[:port]` of an HTTPS URL, resolved to a public address. Registry and
+/// token hosts come from Dockerfiles and registry responses, so a request
+/// must never reach the local machine or the internal network: names that
+/// are IP literals, local-only, or resolve to a non-public address are
+/// refused. Returns curl's `--resolve` pin for the checked address.
+fn public_pin(url: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let authority = url.strip_prefix("https://")?.split(['/', '?', '#']).next()?;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (authority, 443),
+    };
+    let host_ok = host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
+        && ![".local", ".localhost", ".internal", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s));
+    if !host_ok {
+        return None;
+    }
+    let addrs: Vec<_> = (host, port).to_socket_addrs().ok()?.collect();
+    if addrs.is_empty() || !addrs.iter().all(|a| is_public(a.ip())) {
+        return None;
+    }
+    let ip = match addrs[0].ip() {
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        v4 => v4.to_string(),
+    };
+    Some(format!("{host}:{port}:{ip}"))
+}
+
 /// One HTTPS GET with curl: status, response headers, body.
 fn http_get(url: &str, accept: &str, token: Option<&str>) -> Option<(u16, String, String)> {
+    let pin = public_pin(url)?;
     let mut c = command("curl");
-    // -q: ignore ~/.curlrc. HTTPS only, also across redirects (blobs often
-    // redirect to a CDN; curl drops the Authorization header there).
-    c.args(["-q", "-s", "-L", "--proto", "=https", "--proto-redir", "=https", "--max-time", "20"])
-        .args(["--max-filesize", "4000000", "-D", "/dev/stderr", "-w", "\n%{http_code}", "-H"])
+    // -q: ignore ~/.curlrc. -g: no URL globbing. HTTPS only, also across
+    // redirects (blobs redirect to a CDN; curl drops the Authorization header
+    // there). The host is pinned to the address checked above.
+    c.args(["-q", "-g", "-s", "-L", "--max-redirs", "3", "--proto", "=https", "--proto-redir", "=https"])
+        .args(["--max-time", "20", "--max-filesize", "4000000", "--resolve", &pin])
+        .args(["-D", "/dev/stderr", "-w", "\n%{http_code}", "-H"])
         .arg(format!("Accept: {accept}"));
     if let Some(t) = token {
         c.arg("-H").arg(format!("Authorization: Bearer {t}"));
@@ -218,7 +283,8 @@ fn pull_token(headers: &str) -> Option<String> {
         let end = start + params[start..].find('"')?;
         Some(params[start..end].to_string())
     };
-    let realm = get("realm").filter(|r| r.starts_with("https://") && !r.contains(['?', ' ', '"']))?;
+    let realm = get("realm")
+        .filter(|r| r.starts_with("https://") && r.chars().all(|c| c.is_ascii_alphanumeric() || ".-_/:".contains(c)))?;
     let mut url = realm;
     let mut sep = '?';
     for key in ["service", "scope"] {
@@ -369,6 +435,38 @@ mod tests {
         for image in ["docker.umami.is/umami-software/umami:postgresql-latest", "serversideup/php:8.5-fpm-nginx"] {
             let layers = tag_layers(image, "amd64");
             assert!(layers.as_ref().is_some_and(|l| !l.is_empty()), "{image}: {layers:?}");
+        }
+    }
+
+    #[test]
+    fn only_public_hosts() {
+        use std::net::IpAddr;
+        for ip in [
+            "10.0.0.25",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for ip in ["140.82.112.33", "2606:4700::6810:84e5"] {
+            assert!(is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for url in [
+            "https://10.0.0.25/v2/x",
+            "https://localhost:5000/v2/x",
+            "https://[::1]/v2/x",
+            "https://registry.local/v2/x",
+            "https://intranet/v2/x",
+            "http://ghcr.io/v2/x",
+        ] {
+            assert_eq!(public_pin(url), None, "{url}");
         }
     }
 
