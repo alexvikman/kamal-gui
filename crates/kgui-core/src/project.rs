@@ -57,15 +57,31 @@ pub fn name_from_url(url: &str) -> Option<String> {
     (ok && name != "." && name != "..").then(|| name.to_string())
 }
 
-/// Clone the repository and add it to the registry.
-pub fn add(url: &str) -> Result<Project> {
-    let url = url.trim();
-    let name = name_from_url(url).with_context(|| format!("can't derive a project name from {url}"))?;
-    let mut projects = list();
+/// Guards read-modify-write of `projects.json`, so several projects can be
+/// added at once.
+static REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ensure_new(projects: &[Project], name: &str) -> Result<()> {
     if let Some(existing) = projects.iter().find(|p| p.name == name) {
         bail!("a project named {name} already exists ({})", existing.url);
     }
+    Ok(())
+}
+
+/// Clone the repository and add it to the registry. Safe to call for
+/// several repositories in parallel: the clone runs outside the registry lock.
+pub fn add(url: &str) -> Result<Project> {
+    let url = url.trim();
+    let name = name_from_url(url).with_context(|| format!("can't derive a project name from {url}"))?;
+    ensure_new(&list(), &name)?;
     git::ensure_mirror(&name, url)?;
+    let _guard = registry_lock();
+    let mut projects = list();
+    ensure_new(&projects, &name)?;
     let project = Project { name, url: url.to_string(), added_at: crate::history::now_ms() };
     projects.push(project.clone());
     save(&projects)?;
@@ -75,6 +91,7 @@ pub fn add(url: &str) -> Result<Project> {
 /// Remove from the registry and delete the app's clone and worktree.
 /// Run history is kept.
 pub fn remove(name: &str) -> Result<()> {
+    let guard = registry_lock();
     let mut projects = list();
     let before = projects.len();
     projects.retain(|p| p.name != name);
@@ -82,6 +99,7 @@ pub fn remove(name: &str) -> Result<()> {
         bail!("no project named {name}");
     }
     save(&projects)?;
+    drop(guard);
     for dir in [git::worktree_dir(name), git::mirror_dir(name)] {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).with_context(|| format!("could not delete {}", dir.display()))?;

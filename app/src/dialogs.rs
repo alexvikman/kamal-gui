@@ -6,6 +6,9 @@ use kgui_core::github::{self, Repo};
 use kgui_core::project::{self, Project};
 use kgui_core::settings::Settings;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 fn buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.add_space(6.0);
@@ -178,8 +181,7 @@ pub struct AddDialog {
     query: String,
     kamal_only: bool,
     picked: BTreeSet<String>,
-    adding: Option<Task<(Vec<String>, Vec<String>)>>,
-    adding_count: usize,
+    adding: Option<Adding>,
     added: Vec<String>,
     error: Option<String>,
 }
@@ -199,7 +201,6 @@ impl AddDialog {
             kamal_only: true,
             picked: BTreeSet::new(),
             adding: None,
-            adding_count: 0,
             added: Vec::new(),
             error: None,
         }
@@ -238,35 +239,22 @@ impl AddDialog {
             Some(Err(e)) => self.error = Some(e),
             None => {}
         }
-        if let Some(r) = task::poll(&mut self.adding) {
-            match r {
-                Ok((added, failed)) => {
-                    self.added.extend(added);
-                    if failed.is_empty() {
-                        return Some(std::mem::take(&mut self.added));
-                    }
-                    self.error = Some(failed.join("\n"));
-                    self.picked.clear();
-                }
-                Err(e) => self.error = Some(e),
-            }
+        // All went well: close on its own. Otherwise the list stays up with
+        // what failed until Close.
+        if let Some(a) = &self.adding
+            && a.finished()
+            && a.all_added()
+        {
+            self.added.extend(a.added());
+            self.adding = None;
+            return Some(std::mem::take(&mut self.added));
         }
         None
     }
 
     fn start_adding(&mut self, ctx: &egui::Context, urls: Vec<String>) {
         self.error = None;
-        self.adding_count = urls.len();
-        self.adding = Some(Task::spawn(ctx, move || {
-            let (mut added, mut failed) = (Vec::new(), Vec::new());
-            for url in urls {
-                match project::add(&url) {
-                    Ok(p) => added.push(p.name),
-                    Err(e) => failed.push(format!("{url}: {e:#}")),
-                }
-            }
-            Ok((added, failed))
-        }));
+        self.adding = Some(Adding::start(ctx, urls));
     }
 
     /// Returns the names of added projects once the dialog closes.
@@ -274,7 +262,11 @@ impl AddDialog {
         if let Some(done) = self.poll(ctx) {
             return Some(done);
         }
-        let busy = self.adding.is_some();
+        let busy = self.adding.as_ref().is_some_and(|a| !a.finished());
+        if busy {
+            // Elapsed times keep moving.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         let mut close = false;
         let resp = Modal::new(Id::unique("add-project")).show(ctx, |ui| {
             ui.set_width(680.0);
@@ -286,41 +278,52 @@ impl AddDialog {
             });
             ui.separator();
 
-            match self.mode {
-                Mode::Url => {
-                    ui.label(RichText::new("Repository URL").family(theme::medium()));
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.url)
-                            .hint_text("git@github.com:org/app.git")
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.label(
+            if let Some(adding) = &self.adding {
+                adding.ui(ui, &p);
+            } else {
+                match self.mode {
+                    Mode::Url => {
+                        ui.label(RichText::new("Repository URL").family(theme::medium()));
+                        ui.add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut self.url)
+                                .hint_text("git@github.com:org/app.git")
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label(
                         RichText::new(
                             "The app keeps its own clone and deploys from it. Your working copies are never touched.",
                         )
                         .size(12.0)
                         .color(p.muted),
                     );
+                    }
+                    Mode::Github => self.github_list(ui, existing, busy),
                 }
-                Mode::Github => self.github_list(ui, existing, busy),
-            }
-
-            if busy {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!(
-                        "Cloning {} repositor{}…",
-                        self.adding_count,
-                        if self.adding_count == 1 { "y" } else { "ies" }
-                    ));
-                });
             }
             if let Some(e) = &self.error {
                 ui.add(egui::Label::new(RichText::new(e).color(p.bad)).wrap());
             }
 
+            if let Some(adding) = &self.adding {
+                buttons(ui, |ui| {
+                    if busy {
+                        let stopping = adding.stop.load(Ordering::Relaxed);
+                        let label = if stopping { "Stopping…" } else { "Stop" };
+                        if ui
+                            .add_enabled(!stopping, egui::Button::new(label))
+                            .on_hover_text("Finish the clones under way and skip the rest")
+                            .clicked()
+                        {
+                            adding.stop.store(true, Ordering::Relaxed);
+                        }
+                    } else if ui.add(theme::primary("Close")).clicked() {
+                        close = true;
+                    }
+                });
+                return;
+            }
             buttons(ui, |ui| {
                 let (label, urls): (String, Vec<String>) = match self.mode {
                     Mode::Url => (
@@ -347,7 +350,14 @@ impl AddDialog {
                 }
             });
         });
-        if close || (resp.should_close() && !busy) { Some(std::mem::take(&mut self.added)) } else { None }
+        if close || (resp.should_close() && !busy) {
+            if let Some(a) = self.adding.take() {
+                self.added.extend(a.added());
+            }
+            Some(std::mem::take(&mut self.added))
+        } else {
+            None
+        }
     }
 
     fn github_list(&mut self, ui: &mut Ui, existing: &[Project], busy: bool) {
@@ -418,9 +428,185 @@ impl AddDialog {
     }
 }
 
+/// How many repositories are cloned at the same time.
+const PARALLEL_CLONES: usize = 4;
+
+#[derive(Clone)]
+enum CloneState {
+    Waiting,
+    Cloning(Instant),
+    Added(Duration),
+    Failed(String),
+    /// Stopped before it started.
+    Skipped,
+}
+
+/// Repositories being cloned and added, a few at a time, each with its own
+/// state so the dialog can show what's going on.
+struct Adding {
+    names: Vec<String>,
+    states: Arc<Mutex<Vec<CloneState>>>,
+    stop: Arc<AtomicBool>,
+    started: Instant,
+}
+
+impl Adding {
+    fn start(ctx: &egui::Context, urls: Vec<String>) -> Self {
+        let names: Vec<String> = urls.iter().map(|u| project::name_from_url(u).unwrap_or_else(|| u.clone())).collect();
+        let states = Arc::new(Mutex::new(vec![CloneState::Waiting; urls.len()]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicUsize::new(0));
+        let urls = Arc::new(urls);
+        for _ in 0..PARALLEL_CLONES.min(urls.len()) {
+            let (states, stop, next, urls, ctx) =
+                (states.clone(), stop.clone(), next.clone(), urls.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let set = |i: usize, s: CloneState| {
+                    states.lock().unwrap_or_else(|e| e.into_inner())[i] = s;
+                    ctx.request_repaint();
+                };
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(url) = urls.get(i) else { break };
+                    if stop.load(Ordering::Relaxed) {
+                        set(i, CloneState::Skipped);
+                        continue;
+                    }
+                    let t = Instant::now();
+                    set(i, CloneState::Cloning(t));
+                    match project::add(url) {
+                        Ok(_) => set(i, CloneState::Added(t.elapsed())),
+                        Err(e) => set(i, CloneState::Failed(format!("{e:#}"))),
+                    }
+                }
+            });
+        }
+        Self { names, states, stop, started: Instant::now() }
+    }
+
+    fn snapshot(&self) -> Vec<CloneState> {
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn finished(&self) -> bool {
+        self.snapshot().iter().all(|s| !matches!(s, CloneState::Waiting | CloneState::Cloning(_)))
+    }
+
+    fn all_added(&self) -> bool {
+        self.snapshot().iter().all(|s| matches!(s, CloneState::Added(_)))
+    }
+
+    fn added(&self) -> Vec<String> {
+        self.snapshot()
+            .iter()
+            .zip(&self.names)
+            .filter(|(s, _)| matches!(s, CloneState::Added(_)))
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+
+    fn ui(&self, ui: &mut Ui, p: &theme::Palette) {
+        let states = self.snapshot();
+        let count = |f: fn(&CloneState) -> bool| states.iter().filter(|s| f(s)).count();
+        let added = count(|s| matches!(s, CloneState::Added(_)));
+        let failed = count(|s| matches!(s, CloneState::Failed(_)));
+        let skipped = count(|s| matches!(s, CloneState::Skipped));
+        let running = count(|s| matches!(s, CloneState::Cloning(_)));
+        let done = added + failed + skipped;
+        let total = states.len();
+
+        let mut summary = if done < total {
+            format!("Cloning {} of {total}  ·  {done} done", (done + running).min(total))
+        } else {
+            format!("Done: {added} added")
+        };
+        if failed > 0 {
+            summary += &format!(", {failed} failed");
+        }
+        if skipped > 0 {
+            summary += &format!(", {skipped} skipped");
+        }
+        summary += &format!("  ·  {} s", self.started.elapsed().as_secs());
+        ui.horizontal(|ui| {
+            if done < total {
+                ui.spinner();
+            }
+            ui.label(RichText::new(summary).family(theme::medium()));
+        });
+        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_height(4.0));
+        ui.add_space(4.0);
+
+        let slow = states.iter().any(|s| matches!(s, CloneState::Cloning(t) if t.elapsed() > Duration::from_secs(30)));
+        egui::Frame::new().stroke(egui::Stroke::new(1.0, p.border)).corner_radius(6).inner_margin(6).show(ui, |ui| {
+            ScrollArea::vertical().min_scrolled_height(320.0).max_height(420.0).auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    for (name, state) in self.names.iter().zip(&states) {
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(24.0);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            match state {
+                                CloneState::Cloning(_) => {
+                                    egui::Spinner::new().size(12.0).color(theme::ACCENT).paint_at(ui, rect)
+                                }
+                                CloneState::Added(_) => {
+                                    ui.painter().circle_filled(rect.center(), 4.0, p.ok);
+                                }
+                                CloneState::Failed(_) => {
+                                    ui.painter().circle_filled(rect.center(), 4.0, p.bad);
+                                }
+                                CloneState::Waiting | CloneState::Skipped => {
+                                    ui.painter().circle_stroke(rect.center(), 3.5, egui::Stroke::new(1.0, p.muted));
+                                }
+                            }
+                            ui.label(RichText::new(name).family(theme::medium()));
+                            let (text, color) = match state {
+                                CloneState::Waiting => ("waiting".to_string(), p.muted),
+                                CloneState::Cloning(t) => {
+                                    (format!("cloning…  {} s", t.elapsed().as_secs()), theme::ACCENT)
+                                }
+                                CloneState::Added(d) => (format!("added in {} s", d.as_secs()), p.ok),
+                                CloneState::Failed(e) => (e.clone(), p.bad),
+                                CloneState::Skipped => ("skipped".to_string(), p.muted),
+                            };
+                            let r = ui.add(egui::Label::new(RichText::new(&text).size(12.5).color(color)).truncate());
+                            if matches!(state, CloneState::Failed(_)) {
+                                r.on_hover_text(text);
+                            }
+                        });
+                    }
+                },
+            );
+        });
+        if slow {
+            ui.label(theme::caption(
+                "Big repositories take a while. If nothing finishes, check whether 1Password is waiting for you \
+                 to approve the SSH key, and that you can reach GitHub.",
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::split_args;
+
+    /// Each repository gets its own outcome; nothing here reaches the network
+    /// (the URLs are rejected before cloning).
+    #[test]
+    fn adding_reports_each_repository() {
+        use super::{Adding, CloneState};
+        let urls = vec!["not a url".to_string(), "also not one".to_string(), "ftp://x/".to_string()];
+        let adding = Adding::start(&egui::Context::default(), urls);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !adding.finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(adding.finished());
+        assert!(adding.snapshot().iter().all(|s| matches!(s, CloneState::Failed(_))));
+        assert!(!adding.all_added());
+        assert!(adding.added().is_empty());
+    }
 
     #[test]
     fn splits_quoted_args() {
