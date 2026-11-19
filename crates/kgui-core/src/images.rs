@@ -144,6 +144,163 @@ fn github_repo(source: &str) -> Option<String> {
     (ok(owner) && ok(repo)).then(|| format!("{owner}/{repo}"))
 }
 
+/// A `host/repo:tag` image reference, checked so it can go into a registry URL.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ImageRef {
+    /// Registry host (`registry-1.docker.io` for Docker Hub).
+    pub host: String,
+    pub repo: String,
+    pub tag: String,
+}
+
+/// Parse a `FROM` image. Digests are pinned (nothing to compare), and
+/// anything unusual is refused: the reference comes from a cloned repo's
+/// Dockerfile and ends up in an HTTPS request.
+pub fn parse_ref(image: &str) -> Option<ImageRef> {
+    if image.contains('@') {
+        return None;
+    }
+    let (first, rest) = image.split_once('/').unwrap_or(("", image));
+    let explicit_host = first.contains('.') || first.contains(':') || first == "localhost";
+    let (host, path) = if explicit_host { (first, rest) } else { ("docker.io", image) };
+    let (repo, tag) = match path.rsplit_once(':') {
+        Some((r, t)) => (r, t),
+        None => (path, "latest"),
+    };
+    let host = if host == "docker.io" { "registry-1.docker.io" } else { host };
+    let repo = if host == "registry-1.docker.io" && !repo.contains('/') {
+        format!("library/{repo}")
+    } else {
+        repo.to_string()
+    };
+    let host_ok =
+        !host.is_empty() && host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".-:".contains(c));
+    let repo_ok = !repo.is_empty()
+        && !repo.contains("..")
+        && !repo.starts_with('/')
+        && !repo.ends_with('/')
+        && repo.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._/-".contains(c));
+    let tag_ok =
+        !tag.is_empty() && tag.len() <= 128 && tag.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    (host_ok && repo_ok && tag_ok).then(|| ImageRef { host: host.to_string(), repo, tag: tag.to_string() })
+}
+
+const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
+    application/vnd.docker.distribution.manifest.list.v2+json, \
+    application/vnd.oci.image.manifest.v1+json, \
+    application/vnd.docker.distribution.manifest.v2+json";
+
+/// One HTTPS GET with curl: status, response headers, body.
+fn http_get(url: &str, accept: &str, token: Option<&str>) -> Option<(u16, String, String)> {
+    let mut c = command("curl");
+    // -q: ignore ~/.curlrc. HTTPS only, also across redirects (blobs often
+    // redirect to a CDN; curl drops the Authorization header there).
+    c.args(["-q", "-s", "-L", "--proto", "=https", "--proto-redir", "=https", "--max-time", "20"])
+        .args(["--max-filesize", "4000000", "-D", "/dev/stderr", "-w", "\n%{http_code}", "-H"])
+        .arg(format!("Accept: {accept}"));
+    if let Some(t) = token {
+        c.arg("-H").arg(format!("Authorization: Bearer {t}"));
+    }
+    c.arg(url);
+    let out = crate::env::output_within(&mut c, Duration::from_secs(25)).ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = stdout.rsplit_once('\n')?;
+    Some((code.trim().parse().ok()?, String::from_utf8_lossy(&out.stderr).into_owned(), body.to_string()))
+}
+
+/// An anonymous pull token, from the `WWW-Authenticate: Bearer realm=…`
+/// challenge the registry answered with.
+fn pull_token(headers: &str) -> Option<String> {
+    let line = headers.lines().rev().find(|l| l.to_ascii_lowercase().starts_with("www-authenticate: bearer "))?;
+    let params = &line["www-authenticate: bearer ".len()..];
+    let get = |key: &str| {
+        let start = params.find(&format!("{key}=\""))? + key.len() + 2;
+        let end = start + params[start..].find('"')?;
+        Some(params[start..end].to_string())
+    };
+    let realm = get("realm").filter(|r| r.starts_with("https://") && !r.contains(['?', ' ', '"']))?;
+    let mut url = realm;
+    let mut sep = '?';
+    for key in ["service", "scope"] {
+        if let Some(v) = get(key) {
+            let safe = v.chars().all(|c| c.is_ascii_alphanumeric() || "._-:/".contains(c));
+            if !safe {
+                return None;
+            }
+            url.push_str(&format!("{sep}{key}={}", v.replace(':', "%3A").replace('/', "%2F")));
+            sep = '&';
+        }
+    }
+    let (code, _, body) = http_get(&url, "application/json", None)?;
+    if code != 200 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("token").or_else(|| v.get("access_token"))?.as_str().map(String::from)
+}
+
+/// GET from the registry's v2 API, fetching a pull token when asked for one.
+fn registry_get(r: &ImageRef, path: &str, accept: &str, token: &mut Option<String>) -> Option<String> {
+    let url = format!("https://{}/v2/{}/{path}", r.host, r.repo);
+    let (code, headers, body) = http_get(&url, accept, token.as_deref())?;
+    match code {
+        200 => Some(body),
+        401 if token.is_none() => {
+            *token = Some(pull_token(&headers)?);
+            let (code, _, body) = http_get(&url, accept, token.as_deref())?;
+            (code == 200).then_some(body)
+        }
+        _ => None,
+    }
+}
+
+type LayerCache = Mutex<HashMap<String, (Instant, Option<Vec<String>>)>>;
+
+/// The layers (`rootfs.diff_ids`) the tag points to right now, for the given
+/// CPU architecture. An image built `FROM` it starts with exactly these while
+/// the tag hasn't moved. Public images only; cached for 15 minutes.
+pub fn tag_layers(image: &str, arch: &str) -> Option<Vec<String>> {
+    static CACHE: OnceLock<LayerCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    let key = format!("{image} {arch}");
+    if let Some((at, r)) = cache.lock().unwrap().get(&key)
+        && at.elapsed() < Duration::from_secs(15 * 60)
+    {
+        return r.clone();
+    }
+    let result = fetch_tag_layers(image, arch);
+    cache.lock().unwrap().insert(key, (Instant::now(), result.clone()));
+    result
+}
+
+fn fetch_tag_layers(image: &str, arch: &str) -> Option<Vec<String>> {
+    let r = parse_ref(image)?;
+    let digest_ok =
+        |d: &str| d.starts_with("sha256:") && d.len() == 71 && d[7..].chars().all(|c| c.is_ascii_hexdigit());
+    let mut token = None;
+    let json = |s: String| serde_json::from_str::<serde_json::Value>(&s).ok();
+    let mut manifest = json(registry_get(&r, &format!("manifests/{}", r.tag), MANIFEST_TYPES, &mut token)?)?;
+    if let Some(list) = manifest.get("manifests").and_then(|m| m.as_array()) {
+        let digest = list.iter().find_map(|m| {
+            let p = m.get("platform")?;
+            (p.get("os")?.as_str()? == "linux" && p.get("architecture")?.as_str()? == arch)
+                .then(|| m.get("digest")?.as_str().map(String::from))?
+        })?;
+        if !digest_ok(&digest) {
+            return None;
+        }
+        manifest = json(registry_get(&r, &format!("manifests/{digest}"), MANIFEST_TYPES, &mut token)?)?;
+    }
+    let config = manifest.get("config")?.get("digest")?.as_str()?.to_string();
+    if !digest_ok(&config) {
+        return None;
+    }
+    let config = json(registry_get(&r, &format!("blobs/{config}"), "*/*", &mut token)?)?;
+    let ids = config.get("rootfs")?.get("diff_ids")?.as_array()?;
+    let ids: Vec<String> = ids.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +340,35 @@ mod tests {
             "https://github.com/-x/app",
         ] {
             assert_eq!(github_repo(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn image_refs() {
+        let r = |s: &str| parse_ref(s).map(|r| format!("{} {} {}", r.host, r.repo, r.tag));
+        assert_eq!(r("ruby:3.4").as_deref(), Some("registry-1.docker.io library/ruby 3.4"));
+        assert_eq!(
+            r("serversideup/php:8.5-fpm-nginx").as_deref(),
+            Some("registry-1.docker.io serversideup/php 8.5-fpm-nginx")
+        );
+        assert_eq!(
+            r("docker.umami.is/umami-software/umami:postgresql-latest").as_deref(),
+            Some("docker.umami.is umami-software/umami postgresql-latest")
+        );
+        assert_eq!(r("ghcr.io/org/app").as_deref(), Some("ghcr.io org/app latest"));
+        assert_eq!(r("localhost:5000/app:dev").as_deref(), Some("localhost:5000 app dev"));
+        for bad in ["ruby@sha256:abc", "evil.com/../x:1", "Ruby:3", "host.com/app:a?b", "ghcr.io/:x", "a.io/x:$(id)"] {
+            assert_eq!(parse_ref(bad), None, "{bad}");
+        }
+    }
+
+    /// `cargo test -p kgui-core registry_layers -- --ignored` (needs network).
+    #[test]
+    #[ignore]
+    fn registry_layers() {
+        for image in ["docker.umami.is/umami-software/umami:postgresql-latest", "serversideup/php:8.5-fpm-nginx"] {
+            let layers = tag_layers(image, "amd64");
+            assert!(layers.as_ref().is_some_and(|l| !l.is_empty()), "{image}: {layers:?}");
         }
     }
 

@@ -1314,6 +1314,8 @@ fn unit_menu_items(
 fn image_line(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, unit: &Unit, status: Option<&ProjectStatus>) {
     let Some(base) = &unit.base_image else { return };
     let mut running: Vec<(String, Option<String>)> = Vec::new();
+    // Without a version label: whether the tag still points to what runs.
+    let mut current: Vec<bool> = Vec::new();
     let containers = status.into_iter().flat_map(|s| &s.hosts).flat_map(|h| &h.containers);
     for c in containers.filter(|c| own_container(unit, c) && c.state == "running") {
         if let Some(v) = &c.image_version {
@@ -1321,6 +1323,10 @@ fn image_line(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, unit: &Unit, stat
             if !running.contains(&entry) {
                 running.push(entry);
             }
+        } else if let Some(&up_to_date) = status.and_then(|s| s.base_current.get(&c.image))
+            && !current.contains(&up_to_date)
+        {
+            current.push(up_to_date);
         }
     }
     striped(ui, stripes, |ui| {
@@ -1350,6 +1356,17 @@ fn image_line(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, unit: &Unit, stat
                     ui.label(muted(p, version));
                 }
             }
+        }
+        let tag = base.rsplit_once(':').map(|(_, t)| t).unwrap_or("latest");
+        if current.contains(&false) {
+            ui.label(RichText::new("newer image available").size(T).color(p.warn)).on_hover_text(format!(
+                "{tag} has been republished since this was deployed. The image has no version label, so the \
+                 version isn't known. Deploy to pick it up."
+            ));
+        } else if current.contains(&true) {
+            ui.label(RichText::new("latest").size(T).color(p.ok)).on_hover_text(format!(
+                "Built on what {tag} points to now. The image has no version label, so the version isn't known."
+            ));
         }
     });
 }

@@ -62,6 +62,12 @@ pub struct Container {
     pub image_version: Option<String>,
     /// `org.opencontainers.image.source` (where releases are published).
     pub image_source: Option<String>,
+    /// CPU architecture and layers (`RootFS.Layers`) of a running container's
+    /// image, to tell whether its base image tag has moved since.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image_arch: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub image_layers: Vec<String>,
 }
 
 impl Container {
@@ -82,6 +88,7 @@ pub struct HostStatus {
 }
 
 const MARK: &str = "@@KGUI-LABELS@@";
+const LAYERS_MARK: &str = "@@KGUI-LAYERS@@";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -154,15 +161,24 @@ fn containers(host: &str, ssh: &SshTarget, progress: &Progress) -> Result<Vec<Co
     })
 }
 
+/// The shell command run on a server for its status.
+fn status_script() -> String {
+    format!(
+        "docker ps -a --no-trunc --filter label=service --format '{{{{json .}}}}'; echo {MARK}; \
+             docker ps -aq --filter label=service | xargs -r docker inspect --format '{{{{json .Name}}}}{{{{\"\\t\"}}}}{{{{json .Config.Labels}}}}'; \
+             echo {LAYERS_MARK}; \
+             docker ps --filter label=service --format '{{{{.Image}}}}' | sort -u | while read -r i; do \
+               printf '%s\\t%s\\n' \"$i\" \"$(docker image inspect --format '{{{{.Architecture}}}} {{{{join .RootFS.Layers \" \"}}}}' \"$i\" 2>/dev/null)\"; \
+             done"
+    )
+}
+
 fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // One round trip: the container list, then each container's full label map
     // (`docker ps` flattens labels into a comma-separated string, which breaks
-    // on values that contain commas).
+    // on values that contain commas), then the layers of each running image.
     let mut output = ssh_command(host, ssh)?;
-    output.arg(format!(
-            "docker ps -a --no-trunc --filter label=service --format '{{{{json .}}}}'; echo {MARK}; \
-             docker ps -aq --filter label=service | xargs -r docker inspect --format '{{{{json .Name}}}}{{{{\"\\t\"}}}}{{{{json .Config.Labels}}}}'"
-        ));
+    output.arg(status_script());
     let output = match crate::env::output_within(&mut output, HOST_TIMEOUT) {
         Ok(o) => o,
         Err(e) if e.is::<crate::env::TimedOut>() => anyhow::bail!(
@@ -178,6 +194,17 @@ fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     }
     let out = String::from_utf8_lossy(&output.stdout);
     let (ps, inspect) = out.split_once(MARK).unwrap_or((&out, ""));
+    let (inspect, layers) = inspect.split_once(LAYERS_MARK).unwrap_or((inspect, ""));
+    // Image → (architecture, layers).
+    let layers: HashMap<&str, (&str, Vec<String>)> = layers
+        .lines()
+        .filter_map(|l| {
+            let (image, rest) = l.split_once('\t')?;
+            let mut words = rest.split_whitespace();
+            let arch = words.next()?;
+            Some((image, (arch, words.map(String::from).collect())))
+        })
+        .collect();
     let full_labels: HashMap<String, HashMap<String, String>> = inspect
         .lines()
         .filter_map(|l| {
@@ -195,7 +222,11 @@ fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
             let label = |k: &str| labels.get(k).filter(|v| !v.is_empty()).map(|v| v.to_string());
             let full = full_labels.get(&p.names);
             let full_label = |k: &str| full.and_then(|l| l.get(k)).filter(|v| !v.is_empty()).cloned();
+            let (image_arch, image_layers) =
+                layers.get(p.image.as_str()).map(|(a, l)| (a.to_string(), l.clone())).unwrap_or_default();
             Container {
+                image_arch,
+                image_layers,
                 image_version: full_label(crate::images::LABEL_VERSION),
                 image_source: full_label(crate::images::LABEL_SOURCE),
                 version: p.image.rsplit_once(':').map(|(_, t)| t.to_string()).unwrap_or_default(),
@@ -238,6 +269,10 @@ pub struct ProjectStatus {
     /// When the newest running app container was created: the last deploy,
     /// whether it ran from the app or from the kamal CLI.
     pub last_deploy: Option<i64>,
+    /// For running images whose base image carries no version label: whether
+    /// they still start with the layers their base tag points to now (false:
+    /// the tag was republished since the deploy). Keyed by container image.
+    pub base_current: HashMap<String, bool>,
 }
 
 /// Containers of this project's services (apps and accessories) on every
@@ -290,15 +325,44 @@ pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progres
     }
     let sources: std::collections::BTreeSet<&str> =
         result.iter().flat_map(|h| &h.containers).filter_map(|c| c.image_source.as_deref()).collect();
+    // Base images without a version label: compare layers with the registry.
+    let mut unlabeled: Vec<(&str, &str, &str, &[String])> = Vec::new(); // (container image, base, arch, layers)
+    for unit in detail.targets.iter().flat_map(|t| &t.units) {
+        let Some(base) = unit.base_image.as_deref().filter(|b| !crate::images::is_pinned(b)) else { continue };
+        for c in result.iter().flat_map(|h| &h.containers) {
+            let own = unit.config.service.as_deref() == Some(c.service.as_str()) && c.destination == unit.destination;
+            if own
+                && c.state == "running"
+                && c.image_version.is_none()
+                && !c.image_layers.is_empty()
+                && !unlabeled.iter().any(|(i, ..)| *i == c.image)
+            {
+                unlabeled.push((&c.image, base, &c.image_arch, &c.image_layers));
+            }
+        }
+    }
     let step = (!sources.is_empty()).then(|| progress.start("GitHub releases"));
-    let releases = std::thread::scope(|s| {
+    let registry_step = (!unlabeled.is_empty()).then(|| progress.start("Image registries"));
+    let (releases, base_current) = std::thread::scope(|s| {
         let handles: Vec<_> = sources
             .into_iter()
             .map(|src| s.spawn(move || (src.to_string(), crate::images::latest_release(src))))
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).filter_map(|(s, r)| Some((s, r?))).collect()
+        let bases: Vec<_> = unlabeled
+            .iter()
+            .map(|&(image, base, arch, layers)| {
+                s.spawn(move || {
+                    let now = crate::images::tag_layers(base, arch)?;
+                    Some((image.to_string(), layers.starts_with(&now)))
+                })
+            })
+            .collect();
+        let releases: HashMap<String, crate::images::Release> =
+            handles.into_iter().filter_map(|h| h.join().ok()).filter_map(|(s, r)| Some((s, r?))).collect();
+        let current: HashMap<String, bool> = bases.into_iter().filter_map(|h| h.join().ok().flatten()).collect();
+        (releases, current)
     });
-    if let Some(step) = step {
+    for step in [step, registry_step].into_iter().flatten() {
         progress.finish(step);
     }
     let last_deploy = result
@@ -310,7 +374,7 @@ pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progres
     if let Some(at) = last_deploy {
         let _ = crate::history::History::open().and_then(|h| h.record_deploy(&detail.project.name, at));
     }
-    ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms(), last_deploy }
+    ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms(), last_deploy, base_current }
 }
 
 #[cfg(test)]
@@ -337,6 +401,8 @@ mod tests {
                 created: created.into(),
                 image_version: None,
                 image_source: None,
+                image_arch: String::new(),
+                image_layers: Vec::new(),
             }
             .created_ms()
         };
@@ -344,6 +410,39 @@ mod tests {
         assert_eq!(at("2026-11-18 19:20:13 +0000 UTC"), Some(1_795_029_613_000));
         assert_eq!(at("About an hour ago"), None);
         assert_eq!(at(""), None);
+    }
+
+    /// The status script's quoting, run against a stand-in `docker`.
+    #[test]
+    fn status_script_reads_layers() {
+        let dir = std::env::temp_dir().join(format!("kgui-fake-docker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let docker = dir.join("docker");
+        std::fs::write(
+            &docker,
+            r#"#!/bin/sh
+case "$1 $2" in
+  "ps -a") echo '{"ID":"abc","Names":"app-web-1","Image":"app:1","State":"running","Status":"Up","CreatedAt":"2026-11-18 20:20:13 +0100 CET","Labels":"service=app"}' ;;
+  "ps -aq") echo abc ;;
+  "ps --filter") echo app:1; echo app:1 ;;
+  "inspect --format") echo '"/app-web-1"	{"service":"app"}' ;;
+  "image inspect") [ "$3" = "--format" ] && [ "$4" = '{{.Architecture}} {{join .RootFS.Layers " "}}' ] && echo "amd64 sha256:a sha256:b" ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(status_script())
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        let layers = out.split_once(LAYERS_MARK).unwrap().1;
+        assert_eq!(layers.trim(), "app:1\tamd64 sha256:a sha256:b");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
