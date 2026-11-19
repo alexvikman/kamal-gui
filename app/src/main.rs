@@ -55,6 +55,8 @@ fn main() -> eframe::Result {
 /// `.kamal/secrets` calls `kgui secret …`. Expose this binary as `kgui` in a
 /// directory that is put first on PATH for every kamal process.
 fn install_kgui_shim() {
+    // Private data dir first: kamal runs whatever is called `kgui` in here.
+    let _ = settings::ensure_data_dir();
     let dir = settings::data_dir().join("bin");
     if let (Ok(()), Ok(exe)) = (std::fs::create_dir_all(&dir), std::env::current_exe()) {
         let link = dir.join("kgui");

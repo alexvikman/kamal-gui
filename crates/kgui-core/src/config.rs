@@ -34,6 +34,14 @@ pub fn has_key(v: &Value, key: &str) -> bool {
     v.get(key).is_some()
 }
 
+/// Whether a name read from a deploy config (an alias, an accessory, a
+/// destination) or from a server (an image tag) can be handed to kamal as an
+/// argument: it must not look like an option, as `--hosts=…` or `-y` would.
+pub fn is_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Server {
     pub role: String,
@@ -140,8 +148,13 @@ pub fn extract(v: &Value) -> UnitConfig {
         }
     }
 
+    // Alias and accessory names are run as `kamal <alias>` and
+    // `kamal accessory <verb> <name>`. Ones that aren't plain names are left
+    // out (Kamal itself only accepts `[a-z0-9_-]` for aliases).
     let aliases = match v.get("aliases") {
-        Some(Value::Mapping(m)) => m.iter().filter_map(|(k, v)| Some(Alias { name: s(k)?, command: s(v)? })).collect(),
+        Some(Value::Mapping(m)) => {
+            m.iter().filter_map(|(k, v)| Some(Alias { name: s(k).filter(|n| is_name(n))?, command: s(v)? })).collect()
+        }
         _ => vec![],
     };
 
@@ -150,7 +163,7 @@ pub fn extract(v: &Value) -> UnitConfig {
         Some(Value::Mapping(m)) => m
             .iter()
             .filter_map(|(k, av)| {
-                let name = s(k)?;
+                let name = s(k).filter(|n| is_name(n))?;
                 let svc = av
                     .get("service")
                     .and_then(s)

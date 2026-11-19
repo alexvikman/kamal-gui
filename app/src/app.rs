@@ -611,9 +611,8 @@ fn load_ui_state() -> UiState {
 }
 
 fn save_ui_state(state: &UiState) {
-    let _ = std::fs::create_dir_all(data_dir());
     if let Ok(text) = serde_json::to_string(state) {
-        let _ = std::fs::write(ui_state_path(), text);
+        let _ = kgui_core::settings::write_private(&ui_state_path(), text.as_bytes());
     }
 }
 

@@ -75,6 +75,12 @@ fn parse_release(json: &str) -> Result<Release> {
     if r.target_commitish.len() != 40 || !r.target_commitish.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("the nightly release doesn't name the commit it was built from");
     }
+    // Opened in the browser ("Open releases").
+    anyhow::ensure!(
+        r.html_url.starts_with(&format!("{}/releases/", build_info::repo_url())),
+        "unexpected release address: {}",
+        r.html_url
+    );
     Ok(Release {
         title: r.name.unwrap_or_else(|| "Nightly".into()),
         sha: r.target_commitish.clone(),
@@ -304,6 +310,9 @@ mod tests {
                 .is_err()
         );
         assert!(parse_release(&json("main", &zip)).is_err());
+        let elsewhere =
+            json(SHA, &zip).replace("alexvikman/kamal-gui/releases/tag/nightly", "evil/x/releases/tag/nightly");
+        assert!(parse_release(&elsewhere).is_err());
         assert!(parse_release(&json("--flag", &zip)).is_err());
     }
 

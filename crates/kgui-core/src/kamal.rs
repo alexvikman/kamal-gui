@@ -144,10 +144,7 @@ impl Action {
     /// names from deploy configs. Both become kamal arguments, so neither may
     /// look like an option.
     pub fn check(&self) -> anyhow::Result<()> {
-        let word = |s: &str| {
-            s.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-                && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
-        };
+        let word = crate::config::is_name;
         match self {
             Action::Rollback { version } => anyhow::ensure!(word(version), "refusing unsafe version {version:?}"),
             Action::Accessory { name, .. } => anyhow::ensure!(word(name), "refusing unsafe accessory name {name:?}"),
