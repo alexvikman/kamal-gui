@@ -244,7 +244,11 @@ impl KamalApp {
         let running: Vec<String> = running.into_iter().map(String::from).collect();
         let q = self.query.trim().to_lowercase();
         let mut pick = None;
-        let list_height = ui.available_height() - 40.0;
+        // The list ends where the footer starts; its height is measured each
+        // frame (it grows when an update is available).
+        let footer_id = egui::Id::unique("sidebar-footer-height");
+        let footer = ctx.data(|d| d.get_temp::<f32>(footer_id)).unwrap_or(48.0);
+        let list_height = (ui.available_height() - footer - 6.0).max(0.0);
         ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]).show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                 for proj in self.sorted_projects().into_iter().filter(|p| p.name.to_lowercase().contains(&q)) {
@@ -286,16 +290,16 @@ impl KamalApp {
         if let Some(name) = pick {
             self.select(&ctx, Some(name));
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        let footer = ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if let Some(r) = self.update_available.clone().filter(|r| r.is_newer()) {
+            if let Some(r) = self.update_available.clone().filter(|r| r.is_newer()) {
+                ui.horizontal(|ui| {
                     let label = RichText::new("Update available").color(theme::ACCENT);
                     if theme::quiet_rich(ui, label).on_hover_text(format!("{} is out", r.title)).clicked() {
                         self.open_settings(SettingsTab::About);
                     }
-                }
-            });
+                });
+            }
             ui.horizontal(|ui| {
                 if theme::quiet(ui, "+  Add project").clicked() {
                     self.add = Some(AddDialog::new(&ctx));
@@ -308,7 +312,12 @@ impl KamalApp {
                 });
             });
             ui.separator();
+            ui.min_rect().height()
         });
+        if (footer.inner - ctx.data(|d| d.get_temp::<f32>(footer_id)).unwrap_or(0.0)).abs() > 0.5 {
+            ctx.data_mut(|d| d.insert_temp(footer_id, footer.inner));
+            ctx.request_repaint();
+        }
     }
 
     fn central(&mut self, ui: &mut Ui, requests: &mut Vec<Request>) {
