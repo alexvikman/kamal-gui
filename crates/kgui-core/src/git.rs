@@ -79,14 +79,17 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
             std::fs::remove_dir_all(&dir)?;
         }
         // `--` ends option parsing: the URL can never be taken as a flag.
-        run_within(
-            command("git")
-                .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
-                .args(["clone", "--bare", "--quiet", "--", origin])
-                .arg(&dir),
-            CLONE_TIMEOUT,
-        )
-        .with_context(|| format!("could not clone {origin}"))?;
+        ORIGIN_LIMIT
+            .run("origin", || {
+                run_within(
+                    command("git")
+                        .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+                        .args(["clone", "--bare", "--quiet", "--", origin])
+                        .arg(&dir),
+                    CLONE_TIMEOUT,
+                )
+            })
+            .with_context(|| format!("could not clone {origin}"))?;
         run(git(&dir).args(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]))?;
         // Never let stray secrets files make Kamal see an "uncommitted" tree.
         std::fs::create_dir_all(dir.join("info"))?;
@@ -104,14 +107,21 @@ fn ensure_mirror_inner(project: &str, origin: &str) -> Result<PathBuf> {
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Clones and fetches at the same time (refreshing many projects at once
+/// would otherwise ask the SSH agent to sign for all of them together).
+static ORIGIN_LIMIT: crate::env::Limit = crate::env::Limit::new(4);
+
 pub fn fetch(mirror: &Path) -> Result<()> {
-    run_within(
-        git(mirror)
-            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
-            .args(["fetch", "--quiet", "--prune", "--tags", "origin"]),
-        FETCH_TIMEOUT,
-    )
-    .context("git fetch from origin")?;
+    ORIGIN_LIMIT
+        .run("origin", || {
+            run_within(
+                git(mirror)
+                    .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+                    .args(["fetch", "--quiet", "--prune", "--tags", "origin"]),
+                FETCH_TIMEOUT,
+            )
+        })
+        .context("git fetch from origin")?;
     let _ = run(git(mirror).args(["remote", "set-head", "origin", "--auto"]));
     Ok(())
 }

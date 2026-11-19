@@ -118,6 +118,74 @@ pub fn with_ssh<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// At most `max` jobs at a time per key (a server, say); the rest wait.
+pub struct Limit {
+    max: usize,
+    running: std::sync::Mutex<Vec<(String, usize)>>,
+    freed: std::sync::Condvar,
+}
+
+impl Limit {
+    pub const fn new(max: usize) -> Self {
+        Self { max, running: std::sync::Mutex::new(Vec::new()), freed: std::sync::Condvar::new() }
+    }
+
+    pub fn run<T>(&self, key: &str, f: impl FnOnce() -> T) -> T {
+        let _permit = self.acquire(key, &|| false);
+        f()
+    }
+
+    /// A slot if one is free right now.
+    pub fn try_acquire<'a>(&'a self, key: &'a str) -> Option<Permit<'a>> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        self.take(&mut running, key)
+    }
+
+    /// Wait for a slot; gives up (None) once `stop` returns true.
+    pub fn acquire<'a>(&'a self, key: &'a str, stop: &dyn Fn() -> bool) -> Option<Permit<'a>> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(p) = self.take(&mut running, key) {
+                return Some(p);
+            }
+            if stop() {
+                return None;
+            }
+            running = self.freed.wait_timeout(running, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    fn take<'a>(&'a self, running: &mut Vec<(String, usize)>, key: &'a str) -> Option<Permit<'a>> {
+        match running.iter_mut().find(|(k, _)| k == key) {
+            Some((_, n)) if *n >= self.max => None,
+            Some((_, n)) => {
+                *n += 1;
+                Some(Permit(self, key))
+            }
+            None => {
+                running.push((key.to_string(), 1));
+                Some(Permit(self, key))
+            }
+        }
+    }
+}
+
+/// A slot taken from a [`Limit`]; freed when dropped (also on panic).
+pub struct Permit<'a>(&'a Limit, &'a str);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut running = self.0.running.lock().unwrap_or_else(|e| e.into_inner());
+        running.retain_mut(|(k, n)| {
+            if k == self.1 {
+                *n -= 1;
+            }
+            *n > 0
+        });
+        self.0.freed.notify_all();
+    }
+}
+
 /// Run to completion and return trimmed stdout, or an error carrying stderr.
 pub fn run(cmd: &mut Command) -> Result<String> {
     let desc = describe(cmd);
@@ -222,6 +290,50 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let out = run_within(Command::new("sh").args(["-c", "echo hi"]), Duration::from_secs(5)).unwrap();
         assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn limit_caps_jobs_per_key() {
+        static LIMIT: Limit = Limit::new(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let other_ran = Arc::new(AtomicUsize::new(0));
+        let mut handles: Vec<_> = (0..6)
+            .map(|_| {
+                let (active, peak) = (active.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    LIMIT.run("host-a", || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(40));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+            })
+            .collect();
+        // Another key isn't held up by host-a's queue.
+        let other = other_ran.clone();
+        handles.push(std::thread::spawn(move || {
+            LIMIT.run("host-b", || {
+                other.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+        handles.into_iter().for_each(|h| {
+            h.join().unwrap();
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(other_ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waiting_for_a_slot_can_be_given_up() {
+        let limit = Limit::new(1);
+        let held = limit.try_acquire("deploy").unwrap();
+        assert!(limit.try_acquire("deploy").is_none());
+        let started = Instant::now();
+        assert!(limit.acquire("deploy", &|| started.elapsed() > Duration::from_millis(300)).is_none());
+        drop(held);
+        assert!(limit.acquire("deploy", &|| true).is_some());
     }
 
     #[test]

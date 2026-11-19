@@ -62,12 +62,28 @@ impl Status {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Line { key: String, stream: Stream, line: String },
-    End { key: String, status: Status },
+    Line {
+        key: String,
+        stream: Stream,
+        line: String,
+    },
+    End {
+        key: String,
+        status: Status,
+    },
+    /// A deploy is waiting for a free slot (true), or has got one (false).
+    Queued {
+        key: String,
+        queued: bool,
+    },
     RunUpdated(Run),
 }
 
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// Deploys (and redeploys) running at the same time, across all projects.
+pub const MAX_PARALLEL_DEPLOYS: usize = 3;
+static DEPLOY_SLOTS: crate::env::Limit = crate::env::Limit::new(MAX_PARALLEL_DEPLOYS);
 
 /// Handle to the background runner. Cheap to clone.
 #[derive(Clone)]
@@ -127,7 +143,8 @@ impl Runner {
         self.inner.locks.lock().unwrap().entry(name.to_string()).or_default().clone()
     }
 
-    /// Start a kamal run. Returns the history row right away; output and the
+    /// Start a kamal run. Deploys take one of [`MAX_PARALLEL_DEPLOYS`]
+    /// slots and queue when none is free. Returns the history row right away; output and the
     /// final status arrive as events keyed [`run_key`].
     pub fn start_run(
         &self,
@@ -157,7 +174,31 @@ impl Runner {
                 }
                 Err(TryLockError::Poisoned(e)) => e.into_inner(),
             };
-            let result = execute(&out, run_id, &project, &unit_ids, &action, git_ref, &cancel);
+            // Deploys build images locally and open many ssh connections to the
+            // servers: only a few at once.
+            let builds = matches!(action, Action::Deploy | Action::Redeploy);
+            let slot = if builds {
+                match DEPLOY_SLOTS.try_acquire("deploy") {
+                    Some(p) => Some(p),
+                    None => {
+                        out.info(format!(
+                            "Queued: {MAX_PARALLEL_DEPLOYS} deploys are already running. This one starts when one of them finishes."
+                        ));
+                        runner.send(Event::Queued { key: key.clone(), queued: true });
+                        let p = DEPLOY_SLOTS.acquire("deploy", &|| cancel.load(Ordering::Relaxed));
+                        runner.send(Event::Queued { key: key.clone(), queued: false });
+                        p
+                    }
+                }
+            } else {
+                None
+            };
+            let result = if builds && slot.is_none() {
+                Err(RunError::Cancelled)
+            } else {
+                execute(&out, run_id, &project, &unit_ids, &action, git_ref, &cancel)
+            };
+            drop(slot);
             drop(guard);
             runner.unregister(&key);
 

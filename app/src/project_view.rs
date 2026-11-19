@@ -33,6 +33,8 @@ pub struct RunningRun {
     pub label: String,
     pub units: Vec<String>,
     pub started_at: i64,
+    /// Waiting for a free deploy slot.
+    pub queued: bool,
 }
 
 fn elapsed(started_at: i64) -> String {
@@ -154,7 +156,11 @@ impl ProjectView {
         }
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    /// Take in finished background work and start what follows (the server
+    /// check after a fetch). Called every frame for every open project, not
+    /// just the one on screen, so work started there carries on while you're
+    /// looking at another.
+    pub fn poll(&mut self, ctx: &egui::Context) {
         match task::poll(&mut self.load) {
             Some(Ok(l)) => {
                 if self.detail.is_none() {
@@ -454,6 +460,7 @@ impl ProjectView {
                         can_deploy: self.refs.is_some() && running.is_none(),
                         busy: running.is_some(),
                         deploying: running.is_some_and(|r| r.units.contains(&unit.id)),
+                        queued: running.is_some_and(|r| r.queued),
                         repo: theme::github_web(&detail.project.url),
                         branch: detail.default_branch.trim_start_matches("origin/").to_string(),
                     };
@@ -615,6 +622,8 @@ struct UnitCtx<'a> {
     busy: bool,
     /// This unit is part of the run in progress.
     deploying: bool,
+    /// That run is waiting for a free deploy slot.
+    queued: bool,
     /// `https://github.com/org/app`, for links.
     repo: Option<String>,
     /// Default branch (`master`), for compare links.
@@ -810,7 +819,7 @@ fn unit_header(
             unit_menu(ui, unit, cx, service, &mut menu_requests);
             requests.extend(menu_requests);
             if cx.deploying {
-                ui.label(RichText::new("Deploying…").size(T).color(theme::ACCENT));
+                ui.label(RichText::new(if cx.queued { "Queued…" } else { "Deploying…" }).size(T).color(theme::ACCENT));
                 ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
             } else {
                 if let Some(t) = deployed {
@@ -1417,10 +1426,20 @@ fn running_banner(ui: &mut Ui, p: &Palette, run: &RunningRun, requests: &mut Vec
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     let what = if run.label.is_empty() { "Running".to_string() } else { run.label.clone() };
-                    ui.label(RichText::new(format!("{what} in progress")).family(theme::medium()).color(theme::ACCENT));
+                    let state = if run.queued { "queued" } else { "in progress" };
+                    ui.label(RichText::new(format!("{what} {state}")).family(theme::medium()).color(theme::ACCENT));
                     let units: Vec<String> =
                         run.units.iter().map(|u| u.trim_start_matches("config/").replace(".yml", "")).collect();
-                    ui.label(theme::caption(format!("{}  ·  {}", units.join(", "), elapsed(run.started_at))));
+                    let detail = if run.queued {
+                        format!(
+                            "{}  ·  {} deploys are already running; this one starts when one of them finishes",
+                            units.join(", "),
+                            kgui_core::runner::MAX_PARALLEL_DEPLOYS
+                        )
+                    } else {
+                        format!("{}  ·  {}", units.join(", "), elapsed(run.started_at))
+                    };
+                    ui.label(theme::caption(detail));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(theme::danger(ui, "Cancel")).clicked() {

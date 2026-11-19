@@ -71,7 +71,13 @@ Updating is disabled while a deploy is running.
   - `deploy.acme.yml` with a full config → standalone, `-c config/deploy.acme.yml`
 - **Status** comes straight from Docker on each host (`ssh <user>@<host> docker ps`, using Kamal's
   `service`/`role`/`destination` labels). It shows which commit runs where, how far behind the
-  default branch it is, and which older versions you can roll back to.
+  default branch it is, and which older versions you can roll back to. The last check is saved per
+  project and shown at startup; origin and the servers are only asked again on **Refresh** or after a
+  run in the project. Checks share one ssh connection per server and run at most three at a time
+  per server.
+- **Up to three deploys run at once**, across projects; more are queued and start as slots free up.
+  Each deploy builds its image locally and opens several ssh connections, so more at once tends to
+  overload the Mac or the servers' sshd.
 - **Logs** stream with `docker logs --follow` over ssh into a filterable console.
 - **Interactive commands** (`kamal app exec -i`, aliases like `console`/`tinker`, **Open shell**
   on a service or accessory) run in a built-in terminal tab: a real pseudoterminal with an

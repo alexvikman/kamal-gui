@@ -152,13 +152,34 @@ pub fn host_status(host: &str, ssh: &SshTarget, progress: &Progress) -> HostStat
     }
 }
 
+/// Status checks per server at the same time. With many projects on one
+/// server, more would pile up unauthenticated connections (sshd drops them
+/// past `MaxStartups`, 10 by default) and SSH agent signing requests.
+const PER_SERVER: usize = 3;
+static SERVER_LIMIT: crate::env::Limit = crate::env::Limit::new(PER_SERVER);
+
 fn containers(host: &str, ssh: &SshTarget, progress: &Progress) -> Result<Vec<Container>> {
     crate::env::with_ssh(|| {
-        let step = progress.start(host);
-        let result = containers_inner(host, ssh);
-        progress.finish(step);
-        result
+        SERVER_LIMIT.run(host, || {
+            let step = progress.start(host);
+            let result = containers_inner(host, ssh);
+            progress.finish(step);
+            result
+        })
     })
+}
+
+/// Where status checks keep a shared ssh connection per server: one login
+/// (one SSH agent signature) serves the checks that follow for a minute.
+/// Short and in /tmp, as socket paths are limited to ~104 bytes; private to
+/// the user, and refused if anything about it looks off.
+fn control_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let uid = std::fs::metadata(dirs::home_dir()?).ok()?.uid();
+    let dir = std::path::PathBuf::from(format!("/tmp/kgui-ssh-{uid}"));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    (meta.is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o077 == 0).then_some(dir)
 }
 
 /// The shell command run on a server for its status.
@@ -178,6 +199,23 @@ fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // (`docker ps` flattens labels into a comma-separated string, which breaks
     // on values that contain commas), then the layers of each running image.
     let mut output = ssh_command(host, ssh)?;
+    if let Some(dir) = control_dir() {
+        // Options go before the `--` that ssh_command ends with.
+        let mut args: Vec<std::ffi::OsString> = output.get_args().map(|a| a.to_owned()).collect();
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        let control = [
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}/%C", dir.display()).into(),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ];
+        args.splice(at..at, control);
+        let mut c = command("ssh");
+        c.args(args);
+        output = c;
+    }
     output.arg(status_script());
     let output = match crate::env::output_within(&mut output, HOST_TIMEOUT) {
         Ok(o) => o,

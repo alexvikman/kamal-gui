@@ -49,6 +49,8 @@ pub struct Session {
     /// Row positions for the current filter and width (see `update_rows`).
     rows: Option<Rows>,
     pub status: Status,
+    /// A deploy waiting for a free slot (see `runner::MAX_PARALLEL_DEPLOYS`).
+    pub queued: bool,
     /// A finished run read back from history; nothing to cancel.
     pub replay: bool,
     /// The screen of an interactive session (`Kind::Terminal`).
@@ -111,6 +113,7 @@ impl Session {
             dropped: 0,
             rows: None,
             status: Status::Running,
+            queued: false,
             replay: false,
             terminal: None,
         }
@@ -256,6 +259,11 @@ impl Console {
                     self.pending_end.insert(key, status);
                 }
             },
+            Event::Queued { key, queued } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.key == key) {
+                    s.queued = queued;
+                }
+            }
             Event::RunUpdated(run) => return Some(run),
         }
         None

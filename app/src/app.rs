@@ -262,7 +262,8 @@ impl KamalApp {
                         hover += &format!("\nDeployed {} ({})", theme::ago(t), theme::date_time_short(t));
                     }
                     if busy {
-                        hover += "\nA run is in progress";
+                        let queued = self.console.running_in(&proj.name).is_some_and(|s| s.queued);
+                        hover += if queued { "\nA deploy is queued" } else { "\nA run is in progress" };
                     }
                     if r.on_hover_text(hover).clicked() {
                         pick = Some(proj.name.clone());
@@ -333,6 +334,7 @@ impl KamalApp {
                 label: s.label.clone(),
                 units: s.units.clone(),
                 started_at: s.started_at,
+                queued: s.queued,
             });
             view.ui(ui, requests, running.as_ref());
             return;
@@ -565,6 +567,9 @@ impl eframe::App for KamalApp {
         if self.console.any_running() {
             // Keep elapsed times and spinners moving.
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        for v in self.views.values_mut() {
+            v.poll(&ctx);
         }
         let menu_quit = self.menu_actions(&ctx);
         self.poll_updates(&ctx);
