@@ -124,17 +124,11 @@ impl ProjectView {
         }
     }
 
-    /// Coming back to an open project: refresh in the background when the
-    /// data is more than a minute old, keep showing what's there meanwhile.
-    pub fn refresh_if_stale(&mut self, ctx: &egui::Context) {
-        let now = chrono::Utc::now().timestamp_millis();
-        let stale = |t: Option<i64>| t.is_none_or(|t| now - t > 60_000);
-        if self.fetch.is_none() && stale(self.fetched_at) {
-            self.fetch_origin(ctx);
-        }
-        if self.status_task.is_none() && stale(self.status.as_ref().map(|s| s.checked_at)) {
-            self.refresh_status(ctx);
-        }
+    /// Coming back to a project already open in this session: show what was
+    /// loaded then. Fetching and the server check happen when it is first
+    /// opened, after a run in it ends, and on Refresh; nothing else changes it
+    /// while you work from here. Only the local run history is re-read.
+    pub fn on_shown(&mut self) {
         self.history.reload();
     }
 

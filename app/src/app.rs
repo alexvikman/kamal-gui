@@ -172,7 +172,7 @@ impl KamalApp {
         }
         if let Some(n) = &name {
             match self.views.get_mut(n) {
-                Some(view) => view.refresh_if_stale(ctx),
+                Some(view) => view.on_shown(),
                 None => {
                     self.views.insert(n.clone(), ProjectView::new(ctx, n));
                 }
