@@ -6,7 +6,7 @@
 //! and that the app image inherits.
 
 use crate::env::{command, run_within};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -88,7 +88,7 @@ pub fn release_of(version: &str) -> &str {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
     pub tag: String,
     pub published_at: String,

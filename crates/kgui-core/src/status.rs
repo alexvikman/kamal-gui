@@ -46,7 +46,7 @@ impl Progress {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
     pub id: String,
     pub name: String,
@@ -64,9 +64,9 @@ pub struct Container {
     pub image_source: Option<String>,
     /// CPU architecture and layers (`RootFS.Layers`) of a running container's
     /// image, to tell whether its base image tag has moved since.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_arch: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_layers: Vec<String>,
 }
 
@@ -79,7 +79,7 @@ impl Container {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostStatus {
     pub host: String,
     pub ok: bool,
@@ -252,14 +252,14 @@ pub fn hosts_status(hosts: &[(String, SshTarget)], progress: &Progress) -> Vec<H
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
     pub subject: Option<String>,
     /// Commits on the default branch that this version lacks.
     pub behind: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectStatus {
     pub hosts: Vec<HostStatus>,
     pub versions: HashMap<String, VersionInfo>,
@@ -268,11 +268,67 @@ pub struct ProjectStatus {
     pub checked_at: i64,
     /// When the newest running app container was created: the last deploy,
     /// whether it ran from the app or from the kamal CLI.
+    #[serde(default)]
     pub last_deploy: Option<i64>,
     /// For running images whose base image carries no version label: whether
     /// they still start with the layers their base tag points to now (false:
     /// the tag was republished since the deploy). Keyed by container image.
+    #[serde(default)]
     pub base_current: HashMap<String, bool>,
+}
+
+/// Commit subject and how far behind the default branch each running
+/// version is, from the app's clone (no network).
+fn versions_of(detail: &crate::project::ProjectDetail, hosts: &[HostStatus]) -> HashMap<String, VersionInfo> {
+    let rev = &detail.default_branch;
+    let mirror = crate::git::mirror_dir(&detail.project.name);
+    let shas: std::collections::BTreeSet<&str> = hosts
+        .iter()
+        .flat_map(|h| &h.containers)
+        .map(|c| c.version.as_str())
+        .filter(|v| v.len() >= 7 && v.chars().take(7).all(|ch| ch.is_ascii_hexdigit()))
+        .collect();
+    shas.into_iter()
+        .map(|v| {
+            let sha = v.split('_').next().unwrap_or(v);
+            let info = VersionInfo {
+                subject: crate::git::resolve(&mirror, sha).ok().map(|c| c.subject),
+                behind: crate::git::behind(&mirror, sha, rev),
+            };
+            (v.to_string(), info)
+        })
+        .collect()
+}
+
+impl ProjectStatus {
+    /// Recompute "latest" / "N behind" against the clone as it is now, e.g.
+    /// after a fetch, for a status saved earlier.
+    pub fn update_versions(&mut self, detail: &crate::project::ProjectDetail) {
+        self.versions = versions_of(detail, &self.hosts);
+    }
+}
+
+fn saved_path(project: &str) -> Option<std::path::PathBuf> {
+    // Project names are checked when added; refuse anything path-like anyway.
+    let ok = !project.is_empty() && project.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    (ok && !project.starts_with('.'))
+        .then(|| crate::settings::data_dir().join("status").join(format!("{project}.json")))
+}
+
+/// The last complete status check of a project, as saved by
+/// [`project_status`]: shown at startup without asking the servers.
+pub fn load_saved(project: &str) -> Option<ProjectStatus> {
+    serde_json::from_slice(&std::fs::read(saved_path(project)?).ok()?).ok()
+}
+
+fn save(project: &str, status: &ProjectStatus) -> Result<()> {
+    let path = saved_path(project).ok_or_else(|| anyhow::anyhow!("bad project name {project:?}"))?;
+    crate::settings::ensure_data_dir()?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(status)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Containers of this project's services (apps and accessories) on every
@@ -302,27 +358,7 @@ pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progres
         h.containers.retain(|c| services.contains(&c.service));
     }
 
-    let mut versions = HashMap::new();
-    {
-        let rev = &detail.default_branch;
-        let mirror = crate::git::mirror_dir(&detail.project.name);
-        let shas: std::collections::BTreeSet<&str> = result
-            .iter()
-            .flat_map(|h| &h.containers)
-            .map(|c| c.version.as_str())
-            .filter(|v| v.len() >= 7 && v.chars().take(7).all(|ch| ch.is_ascii_hexdigit()))
-            .collect();
-        for v in shas {
-            let sha = v.split('_').next().unwrap_or(v);
-            versions.insert(
-                v.to_string(),
-                VersionInfo {
-                    subject: crate::git::resolve(&mirror, sha).ok().map(|c| c.subject),
-                    behind: crate::git::behind(&mirror, sha, rev),
-                },
-            );
-        }
-    }
+    let versions = versions_of(detail, &result);
     let sources: std::collections::BTreeSet<&str> =
         result.iter().flat_map(|h| &h.containers).filter_map(|c| c.image_source.as_deref()).collect();
     // Base images without a version label: compare layers with the registry.
@@ -374,7 +410,20 @@ pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progres
     if let Some(at) = last_deploy {
         let _ = crate::history::History::open().and_then(|h| h.record_deploy(&detail.project.name, at));
     }
-    ProjectStatus { hosts: result, versions, releases, checked_at: crate::history::now_ms(), last_deploy, base_current }
+    let status = ProjectStatus {
+        hosts: result,
+        versions,
+        releases,
+        checked_at: crate::history::now_ms(),
+        last_deploy,
+        base_current,
+    };
+    // Keep it for the next start, unless a server didn't answer: then the
+    // last complete picture is worth more.
+    if status.hosts.iter().all(|h| h.ok) {
+        let _ = save(&detail.project.name, &status);
+    }
+    status
 }
 
 #[cfg(test)]
@@ -443,6 +492,32 @@ esac
         let layers = out.split_once(LAYERS_MARK).unwrap().1;
         assert_eq!(layers.trim(), "app:1\tamd64 sha256:a sha256:b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A saved status reads back the same, and older files without the
+    /// newer fields still load.
+    #[test]
+    fn saved_status_round_trips() {
+        let container: Container = serde_json::from_value(serde_json::json!({
+            "id": "abc", "name": "app-web-1", "image": "app:1", "version": "1fb4993", "service": "app",
+            "role": "web", "destination": null, "state": "running", "status": "Up 4 seconds",
+            "created": "2026-11-18 20:20:13 +0100 CET", "image_version": null, "image_source": null
+        }))
+        .unwrap();
+        assert!(container.image_layers.is_empty());
+        let status = ProjectStatus {
+            hosts: vec![HostStatus { host: "10.0.0.25".into(), ok: true, error: None, containers: vec![container] }],
+            versions: HashMap::from([("1fb4993".into(), VersionInfo { subject: Some("x".into()), behind: Some(0) })]),
+            releases: HashMap::new(),
+            checked_at: 1,
+            last_deploy: Some(2),
+            base_current: HashMap::from([("app:1".into(), true)]),
+        };
+        let back: ProjectStatus = serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(back.hosts[0].containers[0].status, "Up 4 seconds");
+        assert_eq!(back.base_current.get("app:1"), Some(&true));
+        assert_eq!(back.last_deploy, Some(2));
+        assert!(saved_path("../etc").is_none() && saved_path(".hidden").is_none());
     }
 
     #[test]

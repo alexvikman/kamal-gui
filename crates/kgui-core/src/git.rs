@@ -18,6 +18,13 @@ pub fn mirror_dir(project: &str) -> PathBuf {
     data_dir().join("repos").join(format!("{project}.git"))
 }
 
+/// When the app's clone of a project was last fetched (Unix ms).
+pub fn last_fetch(project: &str) -> Option<i64> {
+    let dir = mirror_dir(project);
+    let modified = ["FETCH_HEAD", "HEAD"].iter().find_map(|f| std::fs::metadata(dir.join(f)).ok()?.modified().ok())?;
+    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+}
+
 pub fn worktree_dir(project: &str) -> PathBuf {
     data_dir().join("worktrees").join(project)
 }

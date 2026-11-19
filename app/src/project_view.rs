@@ -18,6 +18,15 @@ enum Tab {
     History,
 }
 
+/// What a project view starts from, all read from disk.
+struct Loaded {
+    detail: ProjectDetail,
+    /// The last server status saved by a check, if any.
+    status: Option<ProjectStatus>,
+    /// When the clone was last fetched.
+    fetched_at: Option<i64>,
+}
+
 /// A kamal run in progress in this project (from the console).
 pub struct RunningRun {
     pub key: String,
@@ -36,7 +45,7 @@ pub struct ProjectView {
     detail: Option<ProjectDetail>,
     refs: Option<RefList>,
     status: Option<ProjectStatus>,
-    load: Option<Task<ProjectDetail>>,
+    load: Option<Task<Loaded>>,
     fetch: Option<Task<ProjectDetail>>,
     refs_task: Option<Task<RefList>>,
     status_task: Option<Task<ProjectStatus>>,
@@ -72,14 +81,19 @@ impl ProjectView {
             tab: Tab::Overview,
             history: HistoryView::new(Some(name.to_string())),
         };
-        // Show what the local clone has right away, then refresh from origin.
+        // Everything from disk: the clone, and the last server status. Origin
+        // and the servers are only asked on Refresh (or after a run here),
+        // except for a project that has never been checked (see `poll`).
         let n = v.name.clone();
-        v.load = Some(Task::spawn(ctx, move || project::load_detail(project::find(&n)?)));
+        v.load = Some(Task::spawn(ctx, move || {
+            let detail = project::load_detail(project::find(&n)?)?;
+            let status = status::load_saved(&n).map(|mut s| {
+                s.update_versions(&detail);
+                s
+            });
+            Ok(Loaded { fetched_at: git::last_fetch(&n), detail, status })
+        }));
         v.load_refs(ctx);
-        // GitHub first; the server check starts when the fetch is done (see
-        // `poll`). The SSH agent then asks for its keys in a fixed order,
-        // one at a time.
-        v.fetch_origin(ctx);
         v
     }
 
@@ -142,9 +156,18 @@ impl ProjectView {
 
     fn poll(&mut self, ctx: &egui::Context) {
         match task::poll(&mut self.load) {
-            Some(Ok(d)) => {
+            Some(Ok(l)) => {
                 if self.detail.is_none() {
-                    self.detail = Some(d);
+                    self.detail = Some(l.detail);
+                }
+                self.fetched_at = self.fetched_at.or(l.fetched_at);
+                match l.status {
+                    Some(s) if self.status.is_none() => self.status = Some(s),
+                    Some(_) => {}
+                    // Never checked: fetch, then check the servers. GitHub
+                    // first, so the SSH agent asks for its keys one at a time.
+                    None if self.fetch.is_none() && self.status_task.is_none() => self.fetch_origin(ctx),
+                    None => {}
                 }
             }
             Some(Err(e)) => self.error = Some(e),
@@ -167,6 +190,14 @@ impl ProjectView {
         }
         if fetch_finished && self.status.is_none() && self.status_task.is_none() {
             self.refresh_status(ctx);
+        }
+        // A fetch can move the default branch: "N behind" is recomputed from
+        // the clone (no server needed).
+        if fetch_finished
+            && self.status_task.is_none()
+            && let (Some(s), Some(d)) = (&mut self.status, &self.detail)
+        {
+            s.update_versions(d);
         }
         match task::poll(&mut self.refs_task) {
             Some(Ok(r)) => self.refs = Some(r),
