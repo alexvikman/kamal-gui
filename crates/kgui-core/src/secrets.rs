@@ -63,11 +63,15 @@ impl std::fmt::Display for SecretRef {
     }
 }
 
-/// All `kgui secret op://…` references in a secrets file.
+/// All `kgui secret op://…` references in a secrets file. Commented-out lines
+/// are skipped: Kamal never runs them, so their secrets aren't needed.
 pub fn scan(text: &str) -> Vec<SecretRef> {
     static RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"kgui\s+secret\s+["']?(op://[^\s"')]+)"#).unwrap());
-    RE.captures_iter(text).filter_map(|c| SecretRef::parse(&c[1]).ok()).collect()
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(|l| RE.captures_iter(l).filter_map(|c| SecretRef::parse(&c[1]).ok()).collect::<Vec<_>>())
+        .collect()
 }
 
 /// Secrets files Kamal may read: `.kamal/secrets`, `.kamal/secrets.<dest>`,
@@ -305,8 +309,7 @@ mod tests {
 
     #[test]
     fn parse_and_scan() {
-        let t =
-            "# c\nA=$(kgui secret op://deploy/app/APP_KEY)\nB=$(kgui secret \"op://deploy/docker-hub/PW\")\nC=$OTHER\n";
+        let t = "# c\nA=$(kgui secret op://deploy/app/APP_KEY)\nB=$(kgui secret \"op://deploy/docker-hub/PW\")\nC=$OTHER\n  # D=$(kgui secret op://deploy/app/OLD)\n";
         let refs = scan(t);
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].item, "app");

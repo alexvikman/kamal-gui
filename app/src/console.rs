@@ -229,6 +229,7 @@ impl Console {
     pub fn open(&mut self, mut session: Session) {
         if self.sessions.iter().any(|s| s.key == session.key) {
             self.focus(&session.key);
+            self.collapsed = false;
             return;
         }
         if let Some(early) = self.pending.remove(&session.key) {
@@ -314,6 +315,7 @@ impl Console {
 
     pub fn open_run_log(&mut self, run: &Run) {
         if self.focus(&runner::run_key(run.id)) {
+            self.collapsed = false;
             return;
         }
         let mut s = Session::new(
@@ -810,6 +812,16 @@ mod tests {
         s.update_rows("error", 80, 16.0);
         let sel = (Pos { line: 0, col: 0 }, Pos { line: 2, col: 11 });
         assert_eq!(s.selected_text(sel), "ERROR one\nERROR three");
+    }
+
+    #[test]
+    fn opening_a_tab_again_restores_a_minimized_console() {
+        let mut c = Console::default();
+        c.open(session(&["a"]));
+        c.collapsed = true;
+        c.open(session(&["a"]));
+        assert!(!c.collapsed);
+        assert_eq!(c.sessions.len(), 1);
     }
 
     #[test]
