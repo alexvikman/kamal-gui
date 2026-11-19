@@ -212,12 +212,25 @@ fn is_public(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+            let s = v6.segments();
+            // Only global unicast (2000::/3). That leaves out loopback,
+            // link-local, unique-local, site-local, NAT64 (64:ff9b::/96) and
+            // IPv4-compatible addresses.
+            if s[0] & 0xe000 != 0x2000 {
+                return false;
+            }
+            match (s[0], s[1]) {
+                // 6to4 carries an IPv4 address: judge that one.
+                (0x2002, _) => is_public(IpAddr::V4(std::net::Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    s[1] as u8,
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                ))),
+                // Teredo, and documentation addresses.
+                (0x2001, 0x0000) | (0x2001, 0x0db8) => false,
+                _ => true,
+            }
         }
     }
 }
@@ -229,7 +242,7 @@ fn is_public(ip: std::net::IpAddr) -> bool {
 /// refused. Returns curl's `--resolve` pin for the checked address.
 fn public_pin(url: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
-    let authority = url.strip_prefix("https://")?.split(['/', '?', '#']).next()?;
+    let authority = authority(url)?;
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().ok()?),
         None => (authority, 443),
@@ -252,16 +265,45 @@ fn public_pin(url: &str) -> Option<String> {
     Some(format!("{host}:{port}:{ip}"))
 }
 
-/// One HTTPS GET with curl: status, response headers, body.
+/// One HTTPS GET with curl: status, response headers, body. Redirects
+/// (registries send blob downloads to a CDN) are followed here, not by curl,
+/// so every hop goes through [`public_pin`]. The token only goes to the
+/// first host.
 fn http_get(url: &str, accept: &str, token: Option<&str>) -> Option<(u16, String, String)> {
+    let mut url = url.to_string();
+    let first_host = authority(&url)?.to_string();
+    for _ in 0..4 {
+        let token = token.filter(|_| authority(&url) == Some(first_host.as_str()));
+        let (code, headers, body) = http_get_once(&url, accept, token)?;
+        if !matches!(code, 301 | 302 | 303 | 307 | 308) {
+            return Some((code, headers, body));
+        }
+        let location = headers.lines().rev().find_map(|l| {
+            l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim().to_string())
+        })?;
+        url = if location.starts_with("https://") {
+            location
+        } else if location.starts_with('/') && !location.starts_with("//") {
+            format!("https://{}{location}", authority(&url)?)
+        } else {
+            return None;
+        };
+    }
+    None
+}
+
+/// `host[:port]` of an HTTPS URL.
+fn authority(url: &str) -> Option<&str> {
+    url.strip_prefix("https://")?.split(['/', '?', '#']).next().filter(|a| !a.is_empty())
+}
+
+fn http_get_once(url: &str, accept: &str, token: Option<&str>) -> Option<(u16, String, String)> {
     let pin = public_pin(url)?;
     let mut c = command("curl");
-    // -q: ignore ~/.curlrc. -g: no URL globbing. HTTPS only, also across
-    // redirects (blobs redirect to a CDN; curl drops the Authorization header
-    // there). The host is pinned to the address checked above.
-    c.args(["-q", "-g", "-s", "-L", "--max-redirs", "3", "--proto", "=https", "--proto-redir", "=https"])
-        .args(["--max-time", "20", "--max-filesize", "4000000", "--resolve", &pin])
-        .args(["-D", "/dev/stderr", "-w", "\n%{http_code}", "-H"])
+    // -q: ignore ~/.curlrc. -g: no URL globbing. No -L: redirects are
+    // followed by the caller. The host is pinned to the address checked above.
+    c.args(["-q", "-g", "-s", "--proto", "=https", "--max-time", "20", "--max-filesize", "4000000"])
+        .args(["--resolve", &pin, "-D", "/dev/stderr", "-w", "\n%{http_code}", "-H"])
         .arg(format!("Accept: {accept}"));
     if let Some(t) = token {
         c.arg("-H").arg(format!("Authorization: Bearer {t}"));
@@ -451,11 +493,17 @@ mod tests {
             "::1",
             "fd00::1",
             "fe80::1",
+            "fec0::1",
             "::ffff:10.0.0.1",
+            "::10.0.0.1",
+            "64:ff9b::a00:19",
+            "2002:a00:19::1",
+            "2001:db8::1",
+            "2001:0:4136:e378::1",
         ] {
             assert!(!is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
-        for ip in ["140.82.112.33", "2606:4700::6810:84e5"] {
+        for ip in ["140.82.112.33", "2606:4700::6810:84e5", "2002:8c52:7021::1"] {
             assert!(is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         for url in [
