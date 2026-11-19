@@ -94,6 +94,9 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     c
 }
 
+/// `kill` by its full path, so stopping a run doesn't depend on PATH.
+pub const KILL: &str = "/bin/kill";
+
 static SSH_APPROVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SSH_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -242,7 +245,7 @@ pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<std::proces
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            let _ = Command::new(KILL).args(["-KILL", "--", &format!("-{}", child.id())]).status();
             let _ = child.wait();
             let _ = (stdout.join(), stderr.join());
             return Err(TimedOut(timeout).into());

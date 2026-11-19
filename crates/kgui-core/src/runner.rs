@@ -373,13 +373,14 @@ fn execute(
 
     let co = checkout(project_name, action.uses_ref(), git_ref)?;
     let (wt, commit) = (co.worktree, co.commit);
+    let rev = git::short_rev(&co.rev);
     if let Ok(h) = History::open() {
-        let _ = h.set_commit(run_id, &co.rev, &commit.sha, &commit.subject);
+        let _ = h.set_commit(run_id, rev, &commit.sha, &commit.subject);
     }
     if co.from_worktree {
         out.info(format!("› Last deployed commit: {} {}", commit.short, commit.subject));
     } else {
-        out.info(format!("› {} → {} {} ({})", co.rev, commit.short, commit.subject, commit.author));
+        out.info(format!("› {rev} → {} {} ({})", commit.short, commit.subject, commit.author));
     }
     let units = find_units(&wt, unit_ids, &commit)?;
 
@@ -551,12 +552,12 @@ fn run_process(out: &Arc<Output>, mut cmd: Command, cancel: &AtomicBool) -> Resu
         }
         if cancel.load(Ordering::SeqCst) {
             let group = format!("-{}", child.id());
-            let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
+            let _ = Command::new(env::KILL).args(["-TERM", "--", &group]).status();
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
                 thread::sleep(Duration::from_millis(50));
             }
-            let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+            let _ = Command::new(env::KILL).args(["-KILL", "--", &group]).status();
             let _ = child.wait();
             join(readers);
             return Err(RunError::Cancelled);
@@ -565,13 +566,18 @@ fn run_process(out: &Arc<Output>, mut cmd: Command, cancel: &AtomicBool) -> Resu
     }
 }
 
+/// Longest stretch of output handled as one line; a longer line continues on
+/// the next. Output comes from servers and containers: without a limit, one
+/// that never sends a newline would fill the app's memory.
+const MAX_LINE: u64 = 256 * 1024;
+
 fn pump(out: Arc<Output>, reader: impl Read + Send + 'static, stream: Stream) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
+            match (&mut reader).take(MAX_LINE).read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf);

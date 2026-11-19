@@ -44,8 +44,7 @@ pub fn list() -> Vec<Project> {
 
 fn save(projects: &[Project]) -> Result<()> {
     let path = registry_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, serde_json::to_string_pretty(projects)?)
+    crate::settings::write_private(&path, serde_json::to_string_pretty(projects)?.as_bytes())
         .with_context(|| format!("could not write {}", path.display()))
 }
 
@@ -69,8 +68,11 @@ fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Names differing only in case count as the same: on macOS they'd share one
+/// clone and one deploy worktree on disk, and each project would then deploy
+/// whichever repository was fetched last.
 fn ensure_new(projects: &[Project], name: &str) -> Result<()> {
-    if let Some(existing) = projects.iter().find(|p| p.name == name) {
+    if let Some(existing) = projects.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
         bail!("a project named {name} already exists ({})", existing.url);
     }
     Ok(())
@@ -80,6 +82,7 @@ fn ensure_new(projects: &[Project], name: &str) -> Result<()> {
 /// several repositories in parallel: the clone runs outside the registry lock.
 pub fn add(url: &str) -> Result<Project> {
     let url = url.trim();
+    git::check_no_credentials(url)?;
     let name = name_from_url(url).with_context(|| format!("can't derive a project name from {url}"))?;
     ensure_new(&list(), &name)?;
     git::ensure_mirror(&name, url)?;
@@ -211,9 +214,10 @@ pub fn build_targets(files: &[String], read: impl Fn(&str) -> Option<String>) ->
 
         let full = config::has_key(&parsed, "servers")
             && (config::has_key(&parsed, "registry") || config::has_key(&parsed, "builder"));
-        let overlay_of = stem
-            .rsplit_once('.')
-            .filter(|(base, dest)| *dest != "workers" && names.contains(format!("{base}.yml").as_str()));
+        // The destination becomes `-d <dest>` for kamal: only a plain name.
+        let overlay_of = stem.rsplit_once('.').filter(|(base, dest)| {
+            *dest != "workers" && config::is_name(dest) && names.contains(format!("{base}.yml").as_str())
+        });
 
         let (unit, group) = match overlay_of {
             Some((base_stem, dest)) if !full => {
@@ -350,6 +354,30 @@ mod tests {
             });
             assert_eq!(t[0].units[0].base_image, None);
         }
+    }
+
+    #[test]
+    fn names_differing_only_in_case_are_the_same_project() {
+        let existing =
+            [Project { name: "My-App".into(), url: "git@github.com:org/My-App.git".into(), added_at: 0, branch: None }];
+        assert!(ensure_new(&existing, "my-app").is_err());
+        assert!(ensure_new(&existing, "My-App").is_err());
+        assert!(ensure_new(&existing, "my-app-2").is_ok());
+    }
+
+    #[test]
+    fn option_like_names_never_become_kamal_arguments() {
+        let config = format!(
+            "{FULL}aliases:\n  console: app exec -i bash\n  --hosts=evil: app details\n  -y: remove\naccessories:\n  redis:\n    host: 10.0.0.2\n  -y:\n    host: 10.0.0.3\n"
+        );
+        let t = targets(&[("deploy.yml", &config), ("deploy.-x.yml", "service: x\n")]);
+        let units: Vec<&Unit> = t.iter().flat_map(|t| &t.units).collect();
+        // `deploy.-x.yml` is its own config, not `-d -x`.
+        assert!(units.iter().all(|u| u.destination.is_none()));
+        assert!(units.iter().all(|u| u.kamal_args().iter().all(|a| a == "-c" || a.starts_with("config/"))));
+        let main = units.iter().find(|u| u.config_file == "config/deploy.yml").unwrap();
+        assert_eq!(main.config.aliases.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["console"]);
+        assert_eq!(main.config.accessories.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["redis"]);
     }
 
     #[test]

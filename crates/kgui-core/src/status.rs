@@ -328,10 +328,11 @@ fn versions_of(detail: &crate::project::ProjectDetail, hosts: &[HostStatus]) -> 
         .collect();
     shas.into_iter()
         .map(|v| {
-            let sha = v.split('_').next().unwrap_or(v);
+            // The tag comes from the server: look it up as a commit id only.
+            let id = crate::git::commit_id(&mirror, v.split('_').next().unwrap_or(v));
             let info = VersionInfo {
-                subject: crate::git::resolve(&mirror, sha).ok().map(|c| c.subject),
-                behind: crate::git::behind(&mirror, sha, rev),
+                subject: id.as_deref().and_then(|id| crate::git::resolve(&mirror, id).ok()).map(|c| c.subject),
+                behind: id.as_deref().and_then(|id| crate::git::behind(&mirror, id, rev)),
             };
             (v.to_string(), info)
         })
@@ -361,11 +362,7 @@ pub fn load_saved(project: &str) -> Option<ProjectStatus> {
 
 fn save(project: &str, status: &ProjectStatus) -> Result<()> {
     let path = saved_path(project).ok_or_else(|| anyhow::anyhow!("bad project name {project:?}"))?;
-    crate::settings::ensure_data_dir()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(status)?)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::settings::write_private(&path, &serde_json::to_vec(status)?)?;
     Ok(())
 }
 

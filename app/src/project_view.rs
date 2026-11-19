@@ -510,10 +510,12 @@ fn ref_label(refs: Option<&RefList>, r: Option<&str>) -> String {
     if let Some(c) = refs.commits.iter().find(|c| c.sha == r) {
         return format!("{} {}", c.short, c.subject);
     }
-    if let Some(g) = refs.refs.iter().find(|g| g.name == r) {
-        return format!("{} ({} {})", g.name, &g.sha[..7], g.subject);
+    // By full ref name: a tag and a branch can share a short name.
+    let full = git::full_rev(r);
+    if let Some(g) = refs.refs.iter().find(|g| g.rev() == full) {
+        return format!("{} ({} {})", g.name, &g.sha[..g.sha.len().min(7)], g.subject);
     }
-    r.to_string()
+    git::short_rev(r).to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,7 +670,7 @@ fn ref_picker(ui: &mut Ui, target: &str, refs: &RefList, current: &str, new_sele
                 ui.separator();
                 ui.label(theme::caption("Branches"));
                 for b in branches {
-                    ui.selectable_value(&mut sel, b.name.clone(), b.name.trim_start_matches("origin/"));
+                    ui.selectable_value(&mut sel, b.rev(), b.name.trim_start_matches("origin/"));
                 }
             }
             let tags: Vec<_> = refs.refs.iter().filter(|r| r.kind == "tag").take(30).collect();
@@ -676,7 +678,7 @@ fn ref_picker(ui: &mut Ui, target: &str, refs: &RefList, current: &str, new_sele
                 ui.separator();
                 ui.label(theme::caption("Tags"));
                 for t in tags {
-                    ui.selectable_value(&mut sel, t.name.clone(), &t.name);
+                    ui.selectable_value(&mut sel, t.rev(), &t.name);
                 }
             }
         });

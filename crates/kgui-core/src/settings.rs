@@ -25,6 +25,35 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Write one of the app's own files in the data dir: readable by the user
+/// only, and all or nothing. A file cut off halfway (a crash, a full disk)
+/// would read back as empty, and the next save would then overwrite the
+/// project list with just the latest change.
+pub fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    ensure_data_dir()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}-{n}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(contents))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -48,8 +77,7 @@ impl Settings {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+        write_private(&path, serde_json::to_string_pretty(self)?.as_bytes())
             .with_context(|| format!("could not write {}", path.display()))
     }
 }

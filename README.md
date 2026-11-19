@@ -59,12 +59,15 @@ Updating is disabled while a deploy is running.
 
 - **Projects are added to the app**, either by picking repositories from GitHub
   (through `gh`, with Kamal repos detected via code search) or by pasting a git URL
-  (`https://…` or ssh, e.g. `git@github.com:org/app.git`).
+  (`https://…` or ssh, e.g. `git@github.com:org/app.git`). A URL with a password or token in it
+  is refused: project URLs are stored and shown as they are.
   The app keeps its own bare clone of each one in
   `~/Library/Application Support/kgui/repos/`. Your working copies are never read or touched.
 - **Deploys run from a dedicated worktree** (`…/kgui/worktrees/<project>`) checked out at
   the commit you pick: the followed branch, one of the latest commits, any branch or tag.
-  You can keep working (dirty tree and all) while a deploy runs.
+  You can keep working (dirty tree and all) while a deploy runs. Branches and tags are always
+  looked up by their full name, so a tag called `origin/main` can never be deployed as the branch,
+  and the clone follows origin when a tag is moved or deleted there.
 - **Each project follows a branch**: origin's default branch unless you pick another one from the
   branch name under the project's title (or with `kgui branch`). Deploy defaults to it, and
   "behind" counts from it.
