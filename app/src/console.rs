@@ -219,7 +219,21 @@ pub struct Console {
     pending: HashMap<String, Vec<(Stream, String)>>,
     pending_end: HashMap<String, Status>,
     terminals_opened: u64,
+    /// Height of the open terminal, as dragged (0: not dragged yet).
+    height: f32,
 }
+
+/// Room the floating terminal takes at the bottom of the main area, so
+/// scrolling content can make space to come out from under it.
+pub fn overlay_space(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(overlay_id())).unwrap_or(0.0)
+}
+
+fn overlay_id() -> egui::Id {
+    egui::Id::unique("console-overlay-space")
+}
+
+const RADIUS: u8 = 10;
 
 fn in_scope(s: &Session, scope: Option<&str>) -> bool {
     scope.is_none() || s.project.as_deref() == scope
@@ -334,6 +348,53 @@ impl Console {
         self.open(s);
     }
 
+    /// The terminal floats over the bottom of `content` (the main area,
+    /// inside its margins, so it lines up with what's on the page) instead
+    /// of taking room from it. Drag its top edge to resize it.
+    pub fn overlay(&mut self, ctx: &egui::Context, content: egui::Rect, runner: &Runner, scope: Option<&str>) {
+        // Gap between the terminal and the content that ends above it.
+        const GAP: f32 = 12.0;
+        if !self.has_tabs(scope) {
+            ctx.data_mut(|d| d.insert_temp(overlay_id(), 0.0f32));
+            return;
+        }
+        let max = (content.height() - GAP - 80.0).max(120.0);
+        let height = if self.collapsed {
+            36.0
+        } else {
+            let h = if self.height > 0.0 { self.height } else { 340.0 };
+            h.clamp(120.0f32.min(max), max)
+        };
+        ctx.data_mut(|d| d.insert_temp(overlay_id(), height + GAP));
+        let rect =
+            egui::Rect::from_min_max(egui::pos2(content.left(), content.bottom() - height), content.right_bottom());
+        egui::Area::new(egui::Id::unique("console-overlay"))
+            .order(egui::Order::Middle)
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                let shadow = egui::Shadow { offset: [0, 6], blur: 28, spread: 0, color: Color32::from_black_alpha(70) };
+                ui.painter().add(shadow.as_shape(rect, RADIUS));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.set_min_size(rect.size());
+                    ui.set_max_size(rect.size());
+                    self.ui(ui, runner, scope);
+                });
+                if !self.collapsed {
+                    let edge = egui::Rect::from_min_max(
+                        rect.left_top() - egui::vec2(0.0, 3.0),
+                        rect.right_top() + egui::vec2(0.0, 4.0),
+                    );
+                    let r = ui
+                        .interact(edge, ui.scope_id().with("resize"), egui::Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                    if r.dragged() {
+                        self.height = (height - r.drag_delta().y).clamp(120.0f32.min(max), max);
+                    }
+                }
+            });
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, runner: &Runner, scope: Option<&str>) {
         for s in &mut self.sessions {
             if let Some(t) = &s.terminal {
@@ -341,9 +402,11 @@ impl Console {
             }
         }
         *ui.visuals_mut() = terminal_visuals();
-        egui::Frame::new().fill(BG).show(ui, |ui| {
+        let top = egui::CornerRadius { nw: RADIUS, ne: RADIUS, sw: 0, se: 0 };
+        egui::Frame::new().fill(BG).corner_radius(RADIUS).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            egui::Frame::new().fill(BAR).inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
+            let bar = if self.collapsed { egui::CornerRadius::same(RADIUS) } else { top };
+            egui::Frame::new().fill(BAR).corner_radius(bar).inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.toolbar(ui, runner, scope);
             });

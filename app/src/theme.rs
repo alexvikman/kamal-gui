@@ -388,6 +388,23 @@ pub fn github_web(url: &str) -> Option<String> {
 
 /// Text that opens `url` in the browser: looks like the surrounding text,
 /// underlined with a hand cursor on hover. Plain text when `url` is None.
+/// Every text in a block or table row has this size; weight and color set
+/// what matters, so all lines share one baseline.
+pub const ROW_TEXT: f32 = 13.5;
+/// Every other row of a block or table is tinted.
+pub const STRIPE: Color32 = Color32::from_rgb(0xf7, 0xf7, 0xf8);
+
+/// A link in a block or table row, the same size as the text around it.
+pub fn row_link(ui: &mut Ui, text: &str) -> egui::Response {
+    let r = ui
+        .add(egui::Label::new(RichText::new(text).size(ROW_TEXT).color(ACCENT)).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if r.hovered() {
+        ui.painter().hline(r.rect.x_range(), r.rect.bottom(), Stroke::new(1.0, ACCENT));
+    }
+    r
+}
+
 /// Text that opens a menu: a small chevron after it, underlined on hover.
 pub fn menu_label(ui: &mut Ui, text: RichText, enabled: bool) -> egui::Response {
     let r = ui.add_enabled(enabled, egui::Label::new(text).sense(egui::Sense::click()));

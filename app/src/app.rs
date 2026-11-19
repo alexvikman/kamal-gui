@@ -578,24 +578,16 @@ impl eframe::App for KamalApp {
         let mut requests = Vec::new();
         let scope = self.current.clone();
         egui::Panel::left("sidebar").resizable(false).exact_size(240.0).show(ui, |ui| self.sidebar(ui));
-        // The terminal only appears once this project has something to show.
-        if self.console.has_tabs(scope.as_deref()) {
-            if self.console.collapsed {
-                egui::Panel::bottom("console-collapsed")
-                    .exact_size(36.0)
-                    .frame(egui::Frame::new().fill(crate::console::BG))
-                    .show(ui, |ui| self.console.ui(ui, &self.runner, scope.as_deref()));
-            } else {
-                egui::Panel::bottom("console")
-                    .resizable(true)
-                    .default_size(340.0)
-                    .frame(egui::Frame::new().fill(crate::console::BG))
-                    .show(ui, |ui| self.console.ui(ui, &self.runner, scope.as_deref()));
-            }
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 16)))
-            .show(ui, |ui| self.central(ui, &mut requests));
+        let margin = egui::Margin::symmetric(24, 16);
+        let content = egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(margin))
+            .show(ui, |ui| self.central(ui, &mut requests))
+            .response
+            .rect
+            - margin;
+        // The terminal floats over the main area once this project has
+        // something to show.
+        self.console.overlay(&ctx, content, &self.runner, scope.as_deref());
 
         for r in requests {
             self.handle(&ctx, r);

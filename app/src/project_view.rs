@@ -328,6 +328,8 @@ impl ProjectView {
                 ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     self.banners(ui, &p, running, requests);
                     self.overview(ui, &p, requests, running);
+                    // Room to scroll the last service out from under the terminal.
+                    ui.add_space(crate::console::overlay_space(ui.ctx()));
                 });
             }
         }
@@ -791,11 +793,8 @@ fn freshness(
     }
 }
 
-/// Every text in a service's block has this size; weight and color set
-/// what matters, so all lines share one baseline.
-const T: f32 = 13.5;
-/// Every other row of a block is tinted.
-const STRIPE: egui::Color32 = egui::Color32::from_rgb(0xf7, 0xf7, 0xf8);
+const T: f32 = theme::ROW_TEXT;
+const STRIPE: egui::Color32 = theme::STRIPE;
 
 fn muted(p: &Palette, s: impl Into<String>) -> RichText {
     RichText::new(s).size(T).color(p.muted)
@@ -829,17 +828,6 @@ fn striped<R>(ui: &mut Ui, stripes: &mut Stripes, add: impl FnOnce(&mut Ui) -> R
             .inner
         })
         .inner
-}
-
-/// A link in a block row, the same size as the text around it.
-fn row_link(ui: &mut Ui, text: &str) -> egui::Response {
-    let r = ui
-        .add(egui::Label::new(RichText::new(text).size(T).color(theme::ACCENT)).sense(egui::Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if r.hovered() {
-        ui.painter().hline(r.rect.x_range(), r.rect.bottom(), egui::Stroke::new(1.0, theme::ACCENT));
-    }
-    r
 }
 
 /// One service as a block: a header with what applies to the whole service
@@ -1171,7 +1159,7 @@ fn container_row(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, line: Containe
             }
             ui.allocate_ui_with_layout(vec2(36.0, 22.0), Layout::right_to_left(Align::Center), |ui| {
                 ui.set_width(36.0);
-                if line.logs && row_link(ui, "Logs").clicked() {
+                if line.logs && theme::row_link(ui, "Logs").clicked() {
                     click.logs = true;
                 }
             });

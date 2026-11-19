@@ -48,103 +48,150 @@ impl HistoryView {
             return None;
         }
         use egui_extras::{Column, TableBuilder};
+        const T: f32 = theme::ROW_TEXT;
+        const HEADER: f32 = 36.0;
+        let text = |s: &str| RichText::new(s).size(T);
+        let muted = |s: &str| RichText::new(s).size(T).color(p.muted);
         let mut clicked = None;
         let show_project = self.project.is_none();
-        ui.label(theme::caption("Click a run to see its full output in the terminal below."));
+        let overlay = console::overlay_space(ui.ctx());
+        ui.label(theme::caption("Click a run to see its full output in the terminal."));
         ui.add_space(6.0);
-        theme::card(ui, |ui| {
-            let max_height = (ui.available_height() - 40.0).max(120.0);
-            let mut table = TableBuilder::new(ui)
-                .id_salt(("history", &self.project))
-                .striped(true)
-                // The table scrolls itself and only lays out visible rows.
-                .vscroll(true)
-                .auto_shrink([false, true])
-                .min_scrolled_height(0.0)
-                .max_scroll_height(max_height)
-                .sense(egui::Sense::click())
-                .resizable(false)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::exact(118.0));
-            // Fixed columns stay small; the commit column takes (and gives up)
-            // whatever room is left, so Output always stays visible.
-            if show_project {
-                table = table.column(Column::exact(130.0).clip(true));
-            }
-            table = table
-                .column(Column::exact(90.0).clip(true))
-                .column(Column::exact(140.0).clip(true))
-                .column(Column::remainder().at_least(40.0).clip(true))
-                .column(Column::exact(88.0))
-                .column(Column::exact(60.0))
-                .column(Column::exact(52.0));
+        // Framed like a service block: a header, a divider, striped rows.
+        egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(1).show(
+            ui,
+            |ui| {
+                let block = ui.max_rect();
+                // Rows touch, like a block's rows (their height is all there is).
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // The table ends above the floating terminal, so its last
+                // rows and bottom edge stay in sight.
+                let max_height = (ui.available_height() - 40.0 - overlay).max(120.0);
+                let mut table = TableBuilder::new(ui)
+                    .id_salt(("history", &self.project))
+                    .striped(false)
+                    // The table scrolls itself and only lays out visible rows.
+                    .vscroll(true)
+                    .auto_shrink([false, true])
+                    .min_scrolled_height(0.0)
+                    .max_scroll_height(max_height)
+                    .sense(egui::Sense::click())
+                    .resizable(false)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::exact(132.0));
+                // Fixed columns stay small; the commit column takes (and gives up)
+                // whatever room is left, so Output always stays visible.
+                if show_project {
+                    table = table.column(Column::exact(150.0).clip(true));
+                }
+                table = table
+                    .column(Column::exact(72.0).clip(true))
+                    .column(Column::exact(150.0).clip(true))
+                    .column(Column::remainder().at_least(40.0).clip(true))
+                    .column(Column::exact(96.0))
+                    .column(Column::exact(64.0))
+                    .column(Column::exact(56.0));
 
-            let mut titles = vec!["Started"];
-            if show_project {
-                titles.push("Project");
-            }
-            titles.extend(["Command", "Target", "Commit", "Status", "Duration", ""]);
-            table
-                .header(28.0, |mut h| {
-                    for title in &titles {
-                        h.col(|ui| {
-                            ui.label(RichText::new(*title).family(theme::medium()).color(p.muted));
-                        });
-                    }
-                })
-                .body(|body| {
-                    let runs = &self.runs;
-                    body.rows(32.0, runs.len(), |mut row| {
-                        let r = &runs[row.index()];
-                        row.col(|ui| {
-                            ui.label(theme::date_time_short(r.started_at));
-                        });
-                        if show_project {
-                            row.col(|ui| {
-                                ui.add(egui::Label::new(&r.project).truncate());
+                let mut titles = vec!["Started"];
+                if show_project {
+                    titles.push("Project");
+                }
+                titles.extend(["Command", "Target", "Commit", "Status", "Duration", ""]);
+                table
+                    .header(HEADER, |mut h| {
+                        for (i, title) in titles.iter().enumerate() {
+                            h.col(|ui| {
+                                if i == 0 {
+                                    ui.add_space(13.0);
+                                }
+                                ui.label(muted(title));
                             });
                         }
-                        row.col(|ui| {
-                            ui.add(egui::Label::new(RichText::new(&r.action).monospace()).truncate());
-                        });
-                        row.col(|ui| {
-                            ui.add(egui::Label::new(theme::caption(targets_label(&r.units))).truncate())
-                                .on_hover_text(&r.units);
-                        });
-                        row.col(|ui| {
-                            if let Some(sha) = &r.sha {
-                                let url = repo_of(&r.project).map(|repo| format!("{repo}/commit/{sha}"));
-                                theme::subtle_link(
-                                    ui,
-                                    RichText::new(&sha[..sha.len().min(7)]).monospace(),
-                                    url.as_deref(),
-                                );
-                                ui.add(egui::Label::new(theme::caption(r.subject.as_deref().unwrap_or(""))).truncate());
+                    })
+                    .body(|body| {
+                        let runs = &self.runs;
+                        body.rows(34.0, runs.len(), |mut row| {
+                            let r = &runs[row.index()];
+                            let index = row.index();
+                            row.col(|ui| {
+                                // Every other row is tinted across the whole
+                                // block, starting with the second, as in a
+                                // service block.
+                                if index % 2 == 1 {
+                                    let stripe = egui::Rect::from_x_y_ranges(
+                                        block.x_range().shrink(1.0),
+                                        ui.max_rect().y_range(),
+                                    );
+                                    // The cell clips to itself; the stripe spans the
+                                    // row but stays within the scrolled body.
+                                    let clip = egui::Rect::from_x_y_ranges(block.x_range(), ui.clip_rect().y_range());
+                                    ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip).rect_filled(
+                                        stripe,
+                                        0.0,
+                                        theme::STRIPE,
+                                    );
+                                }
+                                ui.add_space(13.0);
+                                ui.label(text(&theme::date_time_short(r.started_at)));
+                            });
+                            if show_project {
+                                row.col(|ui| {
+                                    ui.add(egui::Label::new(text(&r.project)).truncate());
+                                });
+                            }
+                            row.col(|ui| {
+                                ui.add(egui::Label::new(text(&r.action)).truncate());
+                            });
+                            row.col(|ui| {
+                                ui.add(egui::Label::new(muted(&targets_label(&r.units))).truncate())
+                                    .on_hover_text(&r.units);
+                            });
+                            row.col(|ui| {
+                                if let Some(sha) = &r.sha {
+                                    let url = repo_of(&r.project).map(|repo| format!("{repo}/commit/{sha}"));
+                                    theme::subtle_link(ui, text(&sha[..sha.len().min(7)]), url.as_deref());
+                                    ui.add_space(8.0);
+                                    ui.add(egui::Label::new(muted(r.subject.as_deref().unwrap_or(""))).truncate());
+                                }
+                            });
+                            row.col(|ui| {
+                                let status = Status::from_run(&r.status);
+                                let code =
+                                    r.exit_code.filter(|c| *c != 0).map(|c| format!(" ({c})")).unwrap_or_default();
+                                let label = format!("{}{code}", r.status);
+                                match status {
+                                    Status::Running => {
+                                        ui.add(egui::Spinner::new().size(10.0).color(theme::ACCENT));
+                                        ui.label(text(&label).color(theme::ACCENT));
+                                    }
+                                    Status::Failed | Status::Interrupted => {
+                                        theme::dot(ui, p.bad);
+                                        ui.label(text(&label).color(p.bad));
+                                    }
+                                    _ => {
+                                        theme::dot(ui, console::status_color(&p, status));
+                                        ui.label(muted(&label));
+                                    }
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(muted(&duration(r)));
+                            });
+                            let mut open = false;
+                            row.col(|ui| {
+                                open = theme::row_link(ui, "Output").clicked();
+                            });
+                            if open || row.response().clicked() {
+                                clicked = Some(r.clone());
                             }
                         });
-                        row.col(|ui| {
-                            let status = Status::from_run(&r.status);
-                            if status == Status::Running {
-                                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                            }
-                            let code = r.exit_code.filter(|c| *c != 0).map(|c| format!(" ({c})")).unwrap_or_default();
-                            ui.label(
-                                RichText::new(format!("{}{code}", r.status)).color(console::status_color(&p, status)),
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(theme::caption(duration(r)));
-                        });
-                        let mut open = false;
-                        row.col(|ui| {
-                            open = theme::link(ui, "Output").clicked();
-                        });
-                        if open || row.response().clicked() {
-                            clicked = Some(r.clone());
-                        }
                     });
-                });
-        });
+                // The divider under the header spans the block, drawn last so
+                // nothing in the table covers it.
+                let y = (block.top() + HEADER).round() - 1.0;
+                ui.painter().rect_filled(egui::Rect::from_x_y_ranges(block.x_range(), y..=y + 1.0), 0.0, p.border);
+            },
+        );
         clicked
     }
 }
