@@ -516,6 +516,7 @@ impl Console {
         }
         let font = FontId::monospace(12.5);
         let (row_height, char_width) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
+        let row_height = row_pitch(row_height, ui.ctx().pixels_per_point());
         // A filter change reorders what's shown: start the selection over.
         if s.rows.as_ref().is_some_and(|r| r.filter != filter) {
             s.selection = None;
@@ -539,12 +540,11 @@ impl Console {
                 let total = *rows.tops.last().unwrap();
                 ui.set_height(total);
                 let origin = ui.max_rect().min;
+                // A line's galley, and where each of its characters ended up in it.
                 let galley_of = |r: usize| {
                     let (stream, line) = &s.lines[rows.lines[r] as usize];
-                    let mut job = ansi::layout(line, line_color(*stream, line), font.clone());
-                    job.wrap.max_width = width;
-                    job.wrap.break_anywhere = true;
-                    ui.fonts_mut(|f| f.layout_job(job))
+                    let (job, at) = wrap(ansi::layout(line, line_color(*stream, line), font.clone()), cols);
+                    (ui.fonts_mut(|f| f.layout_job(job)), at)
                 };
                 // Pointer position → place in the output.
                 let hit = |pos: egui::Pos2| -> Option<Pos> {
@@ -553,12 +553,13 @@ impl Console {
                     }
                     let y = (pos.y - origin.y).clamp(0.0, (total - 1.0).max(0.0));
                     let r = rows.tops.partition_point(|&t| t <= y).saturating_sub(1).min(rows.lines.len() - 1);
-                    let galley = galley_of(r);
+                    let (galley, at) = galley_of(r);
                     let local = pos - (origin + egui::vec2(0.0, rows.tops[r]));
                     let col = if pos.y - origin.y >= total {
-                        galley.text().chars().count()
+                        at.len() - 1
                     } else {
-                        galley.cursor_from_pos(local).index.0
+                        let g = galley.cursor_from_pos(local).index.0;
+                        at.partition_point(|&a| a < g)
                     };
                     Some(Pos { line: s.dropped + rows.lines[r] as u64, col })
                 };
@@ -646,22 +647,25 @@ impl Console {
                     if top > viewport.max.y {
                         break;
                     }
-                    let galley = galley_of(r);
+                    let (galley, chars) = galley_of(r);
                     let at = origin + egui::vec2(0.0, top);
                     let abs = s.dropped + rows.lines[r] as u64;
                     if let Some((a, b)) = sel.filter(|(a, b)| a.line <= abs && abs <= b.line) {
-                        let n = galley.text().chars().count();
-                        let from = if abs == a.line { a.col } else { 0 };
+                        let n = chars.len() - 1;
+                        let from = if abs == a.line { a.col.min(n) } else { 0 };
                         let to = if abs == b.line { b.col.min(n) } else { n };
-                        for i in from..to {
-                            let c = galley.pos_from_cursor(egui::text::CCursor::new(i));
+                        // Every cell the selected characters take, without the
+                        // breaks `wrap` put in.
+                        let text: Vec<char> = galley.text().chars().collect();
+                        for g in (chars[from]..chars[to]).filter(|&g| text[g] != '\n') {
+                            let c = galley.pos_from_cursor(egui::text::CCursor::new(g));
                             let cell =
                                 egui::Rect::from_min_size(at + c.min.to_vec2(), egui::vec2(char_width, c.height()));
                             ui.painter().rect_filled(cell, 0.0, SELECTION);
                         }
                         // A selection that goes on to the next line covers the line end too.
                         if abs < b.line {
-                            let c = galley.pos_from_cursor(egui::text::CCursor::new(n));
+                            let c = galley.pos_from_cursor(egui::text::CCursor::new(chars[n]));
                             let cell =
                                 egui::Rect::from_min_size(at + c.min.to_vec2(), egui::vec2(char_width, c.height()));
                             ui.painter().rect_filled(cell, 0.0, SELECTION);
@@ -675,6 +679,56 @@ impl Console {
             ui.ctx().copy_text(text);
         }
     }
+}
+
+/// Distance between wrapped rows as egui lays them out: each row's height is
+/// snapped to whole physical pixels, so it isn't the font's row height. Line
+/// positions are worked out from this without laying lines out, and a
+/// mismatch adds up over a long line until it runs into the next one.
+fn row_pitch(row_height: f32, pixels_per_point: f32) -> f32 {
+    (row_height * pixels_per_point).round() / pixels_per_point
+}
+
+/// Breaks a line into rows of `cols` characters itself, rather than having
+/// egui wrap it. egui snaps each glyph to whole pixels along the whole line,
+/// so its rows hold one character more or less here and there, and a long
+/// line would take more rows than `update_rows` reserved for it and run into
+/// the next one. Each row here starts afresh, so each holds exactly `cols`.
+///
+/// Tabs become four spaces and control characters nothing, as
+/// `display_width` counts them. Also returns where each character of the
+/// line's plain text ended up in the laid-out text, plus where it ends.
+fn wrap(job: egui::text::LayoutJob, cols: usize) -> (egui::text::LayoutJob, Vec<usize>) {
+    let mut out = egui::text::LayoutJob::default();
+    let mut at = Vec::with_capacity(job.text.len() + 1);
+    let (mut g, mut col) = (0, 0);
+    for section in &job.sections {
+        let mut text = String::new();
+        for c in job.text[section.byte_range.start.0..section.byte_range.end.0].chars() {
+            let cells = match c {
+                '\t' => 4,
+                c if c.is_control() => 0,
+                _ => 1,
+            };
+            if cells == 0 {
+                at.push(g);
+            }
+            for cell in 0..cells {
+                if col == cols {
+                    text.push('\n');
+                    (g, col) = (g + 1, 0);
+                }
+                if cell == 0 {
+                    at.push(g);
+                }
+                text.push(if c == '\t' { ' ' } else { c });
+                (g, col) = (g + 1, col + 1);
+            }
+        }
+        out.append(&text, 0.0, section.format.clone());
+    }
+    at.push(g);
+    (out, at)
 }
 
 /// Selected output's background.
@@ -963,5 +1017,49 @@ mod drag_tests {
         let text = copied.last().expect("Cmd+C copies");
         // The first line is cut where the drag ended (mid-line); the rest are whole.
         assert!(text.lines().count() > 3 && text.lines().skip(1).all(|l| l.starts_with("line ")), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod layout {
+    use super::*;
+
+    /// A long line, as laid out, takes exactly the rows and the height
+    /// `update_rows` reserves for it, and fits the width: otherwise it runs
+    /// into the next line (or leaves a gap), more so the longer it is.
+    #[test]
+    fn wrapped_lines_take_the_room_reserved_for_them() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let line = "INFO [21b171be] Running docker run\t--detach --name mi-web-workers --env A=\"b\" ".repeat(30);
+        for ppp in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            ctx.set_pixels_per_point(ppp);
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let font = FontId::monospace(12.5);
+                let (row_height, char_width) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
+                let pitch = row_pitch(row_height, ppp);
+                for tenths in 2000..12000 {
+                    let width = tenths as f32 / 10.0;
+                    let cols = ((width / char_width).floor() as usize).max(1);
+                    let rows = (display_width(&line) as usize).div_ceil(cols);
+                    let (job, _) = wrap(ansi::layout(&line, TEXT, font.clone()), cols);
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    assert_eq!(galley.rows.len(), rows, "rows at {ppp}x, width {width}");
+                    let last = galley.rows.last().unwrap().pos.y;
+                    assert!((last - (rows - 1) as f32 * pitch).abs() < 0.01, "height at {ppp}x, width {width}");
+                    assert!(galley.size().x <= width + 1.0, "too wide at {ppp}x, width {width}");
+                }
+            });
+            out.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn wraps_at_the_column_count() {
+        let font = FontId::monospace(12.5);
+        let (job, at) = wrap(ansi::layout("ab\x1b[31mcd\x1b[0me\tf\rg", TEXT, font), 3);
+        assert_eq!(job.text, "abc\nde \n   \nfg");
+        // a b c d e tab f \r g, then the end.
+        assert_eq!(at, [0, 1, 2, 4, 5, 6, 12, 13, 13, 14]);
     }
 }
