@@ -559,6 +559,12 @@ impl KamalApp {
 }
 
 impl eframe::App for KamalApp {
+    /// Only the window's size and place are kept between launches (see
+    /// `main`); the app saves its own UI state itself.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok(event) = self.events.try_recv() {

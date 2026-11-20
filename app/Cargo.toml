@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-eframe = "0.37.0"
+eframe = { version = "0.37.0", features = ["persistence"] }
 egui = "0.37.0"
 egui_extras = "0.37.0"
 kgui-core = { path = "../crates/kgui-core" }

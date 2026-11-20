@@ -44,6 +44,10 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Reopen the window at the size and place it was closed at. eframe
+        // keeps that in a file of its own; put it with the app's other files.
+        persist_window: true,
+        persistence_path: Some(settings::data_dir().join("window.ron")),
         // winit's default macOS menu quits on Cmd+Q without asking the app,
         // which would cut a running deploy off. The app handles Cmd+Q itself.
         #[cfg(target_os = "macos")]
