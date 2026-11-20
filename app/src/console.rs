@@ -437,7 +437,7 @@ impl Console {
                 ui.label(RichText::new("Deploys and logs for this project show up here.").color(DIM));
                 return;
             }
-            let tools_width = 300.0;
+            let tools_width = 360.0;
             ScrollArea::horizontal()
                 .max_width((ui.available_width() - tools_width).max(120.0))
                 .id_salt("console-tabs")
@@ -467,8 +467,17 @@ impl Console {
                 ui.add_space(2.0);
                 let Some(s) = active.as_ref().and_then(|k| self.sessions.iter().find(|s| &s.key == k)) else { return };
                 if s.status == Status::Running && !s.replay {
-                    let label = if s.kind == Kind::Run { "Cancel" } else { "Stop" };
-                    if ui.add(egui::Button::new(RichText::new(label).color(ERROR))).clicked() {
+                    // Stopping a log stream leaves the container alone: say so, and don't paint it red.
+                    let button = match s.kind {
+                        Kind::Run => egui::Button::new(RichText::new("Cancel").color(ERROR)),
+                        Kind::Terminal => egui::Button::new(RichText::new("Stop").color(ERROR)),
+                        Kind::Log => egui::Button::new("Stop following"),
+                    };
+                    let mut response = ui.add(button);
+                    if s.kind == Kind::Log {
+                        response = response.on_hover_text("Stop streaming new lines. The container keeps running.");
+                    }
+                    if response.clicked() {
                         match &s.terminal {
                             Some(t) => t.stop(),
                             None => runner.cancel(&s.key),
