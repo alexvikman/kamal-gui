@@ -493,6 +493,7 @@ impl ProjectView {
                         queued: running.is_some_and(|r| r.queued),
                         repo: theme::github_web(&detail.project.url),
                         branch: detail.branch.trim_start_matches("origin/").to_string(),
+                        sha: selected_sha(self.refs.as_ref(), current.as_deref()),
                     };
                     unit_rows(ui, p, unit, &cx, requests);
                 }
@@ -503,6 +504,16 @@ impl ProjectView {
             ui.add_space(18.0);
         }
     }
+}
+
+/// The commit a selected ref (commit, branch or tag) points at.
+fn selected_sha(refs: Option<&RefList>, r: Option<&str>) -> Option<String> {
+    let (refs, r) = (refs?, r?);
+    if refs.commits.iter().any(|c| c.sha == r) {
+        return Some(r.to_string());
+    }
+    let full = git::full_rev(r);
+    refs.refs.iter().find(|g| g.rev() == full).map(|g| g.sha.clone())
 }
 
 fn ref_label(refs: Option<&RefList>, r: Option<&str>) -> String {
@@ -705,6 +716,8 @@ struct UnitCtx<'a> {
     repo: Option<String>,
     /// Default branch (`master`), for compare links.
     branch: String,
+    /// Commit the selected ref points at: what a deploy would check out.
+    sha: Option<String>,
 }
 
 /// Kamal labels app containers with `service` and, when deployed with -d,
@@ -870,10 +883,7 @@ fn unit_header(
     requests: &mut Vec<Request>,
 ) {
     let file = unit.config_file.trim_start_matches("config/");
-    let about = match &unit.destination {
-        Some(d) => format!("{}  ·  {file} -d {d}", kind_label(&unit.kind)),
-        None => format!("{}  ·  {file}", kind_label(&unit.kind)),
-    };
+    let config_url = config_url(unit, cx);
     let first = live.and_then(|l| l.running.first());
     let deployed = live.and_then(|l| l.running.iter().filter_map(|(_, c)| c.created_ms()).max());
     ui.horizontal(|ui| {
@@ -897,10 +907,42 @@ fn unit_header(
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.label(RichText::new(service).family(theme::medium()).size(T));
-                ui.add(egui::Label::new(muted(p, about)).truncate());
+                ui.label(muted(p, format!("{}  ·", kind_label(&unit.kind))));
+                ui.spacing_mut().item_spacing.x = 4.0;
+                match &config_url {
+                    Some(url) => {
+                        let r = ui
+                            .add(egui::Label::new(muted(p, file)).sense(egui::Sense::click()))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Open on GitHub");
+                        if r.hovered() {
+                            ui.painter().hline(r.rect.x_range(), r.rect.bottom(), egui::Stroke::new(1.0, p.muted));
+                        }
+                        if r.clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    }
+                    None => {
+                        ui.label(muted(p, file));
+                    }
+                }
+                if let Some(d) = &unit.destination {
+                    ui.add(egui::Label::new(muted(p, format!("-d {d}"))).truncate());
+                }
             });
         });
     });
+}
+
+/// The unit's config on GitHub, at the commit a deploy would use (the branch
+/// until refs are loaded): the destination file when there is one, else the config itself.
+fn config_url(unit: &Unit, cx: &UnitCtx) -> Option<String> {
+    let repo = cx.repo.as_ref()?;
+    let file = match &unit.destination {
+        Some(d) => format!("{}.{d}.yml", unit.config_file.trim_end_matches(".yml")),
+        None => unit.config_file.clone(),
+    };
+    Some(format!("{repo}/blob/{}/{file}", cx.sha.as_deref().unwrap_or(&cx.branch)))
 }
 
 /// Width every row reserves on the right for a ⋯ menu.
@@ -1262,14 +1304,9 @@ fn unit_menu_items(
         })
     };
     {
-        if let Some(repo) = &cx.repo {
-            // The destination file when there is one, else the config itself.
-            let file = match &unit.destination {
-                Some(d) => format!("{}.{d}.yml", unit.config_file.trim_end_matches(".yml")),
-                None => unit.config_file.clone(),
-            };
+        if let Some(url) = config_url(unit, cx) {
             if ui.button("Open config on GitHub").clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{repo}/blob/{}/{file}", cx.branch)));
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 ui.close();
             }
             ui.separator();
