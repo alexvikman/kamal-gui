@@ -115,6 +115,15 @@ fn check_ssh_value(value: &str, what: &str, extra: &str) -> Result<()> {
 }
 
 pub fn ssh_command(host: &str, ssh: &SshTarget) -> Result<std::process::Command> {
+    ssh_command_with(host, ssh, std::iter::empty::<&str>())
+}
+
+/// [`ssh_command`] with extra ssh options (`-o …` pairs).
+fn ssh_command_with(
+    host: &str,
+    ssh: &SshTarget,
+    options: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Result<std::process::Command> {
     check_ssh_value(host, "host", "")?;
     check_ssh_value(&ssh.user, "user", "")?;
     if let Some(proxy) = &ssh.proxy {
@@ -140,6 +149,7 @@ pub fn ssh_command(host: &str, ssh: &SshTarget) -> Result<std::process::Command>
     if let Some(proxy) = &ssh.proxy {
         c.arg("-J").arg(proxy);
     }
+    c.args(options);
     // `--` ends option parsing: the host can never be taken as a flag.
     c.arg("--").arg(host);
     Ok(c)
@@ -167,6 +177,55 @@ fn containers(host: &str, ssh: &SshTarget, progress: &Progress) -> Result<Vec<Co
             result
         })
     })
+}
+
+/// The servers the units run on, accessories' included, each once, with how
+/// to reach them.
+pub fn servers_of<'a>(units: impl IntoIterator<Item = &'a crate::project::Unit>) -> Vec<(String, SshTarget)> {
+    let mut hosts: Vec<(String, SshTarget)> = Vec::new();
+    for c in units.into_iter().map(|u| &u.config) {
+        let accessory_hosts = c.accessories.iter().flat_map(|a| &a.hosts);
+        for h in c.servers.iter().map(|s| &s.host).chain(accessory_hosts) {
+            if !hosts.iter().any(|(x, s)| x == h && *s == c.ssh) {
+                hosts.push((h.clone(), c.ssh.clone()));
+            }
+        }
+    }
+    hosts
+}
+
+/// Log in to each server over a new connection, so the SSH agent signs for
+/// it now. 1Password holds back its approval prompt while the requesting app
+/// isn't the frontmost one, and an approval covers the app's child processes
+/// (kamal) until 1Password locks. So asking at the start of a run, while the
+/// user has just clicked, saves kamal from asking minutes later (after a
+/// build), when the prompt would stay hidden and the agent gives up.
+///
+/// The first server goes alone, so there is one prompt; the rest follow in
+/// parallel. Returns the servers that failed, with the reason.
+pub fn authorize(hosts: &[(String, SshTarget)]) -> Vec<(String, String)> {
+    let login = |(host, ssh): &(String, SshTarget)| -> Option<(String, String)> {
+        // No shared connection (ours or one from ~/.ssh/config): it would
+        // skip the signature this is for.
+        let fresh = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
+        let result = ssh_command_with(host, ssh, fresh).and_then(|mut c| {
+            c.arg("true");
+            match crate::env::run_within(&mut c, HOST_TIMEOUT) {
+                Err(e) if e.is::<crate::env::TimedOut>() => {
+                    anyhow::bail!("no answer within {} s", HOST_TIMEOUT.as_secs())
+                }
+                r => r.map(drop),
+            }
+        });
+        result.err().map(|e| (host.clone(), format!("{e:#}")))
+    };
+    let Some((first, rest)) = hosts.split_first() else { return Vec::new() };
+    let mut failed: Vec<_> = login(first).into_iter().collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = rest.iter().map(|h| s.spawn(move || login(h))).collect();
+        failed.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()));
+    });
+    failed
 }
 
 /// Where status checks keep a shared ssh connection per server: one login
@@ -198,24 +257,17 @@ fn containers_inner(host: &str, ssh: &SshTarget) -> Result<Vec<Container>> {
     // One round trip: the container list, then each container's full label map
     // (`docker ps` flattens labels into a comma-separated string, which breaks
     // on values that contain commas), then the layers of each running image.
-    let mut output = ssh_command(host, ssh)?;
-    if let Some(dir) = control_dir() {
-        // Options go before the `--` that ssh_command ends with.
-        let mut args: Vec<std::ffi::OsString> = output.get_args().map(|a| a.to_owned()).collect();
-        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
-        let control = [
-            "-o".into(),
+    let control = control_dir().map(|dir| {
+        [
+            "-o".to_string(),
             "ControlMaster=auto".into(),
             "-o".into(),
-            format!("ControlPath={}/%C", dir.display()).into(),
+            format!("ControlPath={}/%C", dir.display()),
             "-o".into(),
             "ControlPersist=60".into(),
-        ];
-        args.splice(at..at, control);
-        let mut c = command("ssh");
-        c.args(args);
-        output = c;
-    }
+        ]
+    });
+    let mut output = ssh_command_with(host, ssh, control.into_iter().flatten())?;
     output.arg(status_script());
     let output = match crate::env::output_within(&mut output, HOST_TIMEOUT) {
         Ok(o) => o,
@@ -371,22 +423,13 @@ fn save(project: &str, status: &ProjectStatus) -> Result<()> {
 pub fn project_status(detail: &crate::project::ProjectDetail, progress: &Progress) -> ProjectStatus {
     let mut services = std::collections::HashSet::new();
     let mut apps = std::collections::HashSet::new();
-    let mut hosts: Vec<(String, SshTarget)> = Vec::new();
-    for unit in detail.targets.iter().flat_map(|t| &t.units) {
-        let c = &unit.config;
+    let units: Vec<&crate::project::Unit> = detail.targets.iter().flat_map(|t| &t.units).collect();
+    for c in units.iter().map(|u| &u.config) {
         services.extend(c.service.clone());
         apps.extend(c.service.clone());
-        let mut add = |h: &String| {
-            if !hosts.iter().any(|(x, s)| x == h && *s == c.ssh) {
-                hosts.push((h.clone(), c.ssh.clone()));
-            }
-        };
-        c.servers.iter().for_each(|s| add(&s.host));
-        for a in &c.accessories {
-            services.insert(a.service.clone());
-            a.hosts.iter().for_each(&mut add);
-        }
+        services.extend(c.accessories.iter().map(|a| a.service.clone()));
     }
+    let hosts = servers_of(units);
 
     let mut result = hosts_status(&hosts, progress);
     for h in &mut result {

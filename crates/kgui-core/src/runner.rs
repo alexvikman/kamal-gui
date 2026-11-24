@@ -268,7 +268,18 @@ struct Output {
     file: Mutex<Option<File>>,
     /// Secret values to mask in everything emitted, longest first.
     masked: Mutex<Vec<String>>,
+    /// The output shows kamal's SSH agent giving up (see [`AGENT_GAVE_UP`]).
+    agent_gave_up: AtomicBool,
 }
+
+/// How kamal reports that the SSH agent closed the connection without
+/// signing: net-ssh then reads an empty reply and fails on it with this
+/// error. 1Password does that when its approval prompt was held back (the
+/// app wasn't in front) and nobody answered it.
+const AGENT_GAVE_UP: &str = "can't modify frozen String: \"\"";
+const AGENT_HINT: &str = "The SSH agent (1Password) gave up without signing. 1Password holds back its approval \
+     prompt while Kamal GUI isn't the frontmost app: approve it from the 1Password menu bar icon \
+     (\"SSH request waiting\"), or keep Kamal GUI in front, and run again.";
 
 const MASK: &str = "[REDACTED]";
 /// Shorter values (`true`, a port number) would mask ordinary output.
@@ -279,7 +290,13 @@ impl Output {
         use std::os::unix::fs::OpenOptionsExt;
         let file =
             log_file.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p).ok());
-        Arc::new(Self { runner, key, file: Mutex::new(file), masked: Mutex::default() })
+        Arc::new(Self {
+            runner,
+            key,
+            file: Mutex::new(file),
+            masked: Mutex::default(),
+            agent_gave_up: AtomicBool::new(false),
+        })
     }
 
     /// Never show these values, in the console or the stored log, should a
@@ -297,6 +314,9 @@ impl Output {
 
     fn emit(&self, stream: Stream, line: impl Into<String>) {
         let mut line = line.into();
+        if stream != Stream::Info && line.contains(AGENT_GAVE_UP) {
+            self.agent_gave_up.store(true, Ordering::Relaxed);
+        }
         for secret in self.masked.lock().unwrap().iter() {
             if line.contains(secret.as_str()) {
                 line = line.replace(secret.as_str(), MASK);
@@ -411,6 +431,15 @@ fn execute(
         }
     }
 
+    let servers = status::servers_of(&units);
+    if !servers.is_empty() {
+        out.info("› Logging in to the servers (approve the SSH key in 1Password if it asks)…");
+        // Not fatal: kamal connects on its own and reports its own errors.
+        for (host, error) in status::authorize(&servers) {
+            out.info(format!("  {host}: {error}"));
+        }
+    }
+
     let kamal_bin = kamal::binary(&settings);
     let path = path_with(&kamal_bin);
 
@@ -426,7 +455,12 @@ fn execute(
         cmd.args(&args).current_dir(&wt).env("PATH", &path).envs(envs.iter().map(|(k, v)| (k, v)));
         match run_process(out, cmd, cancel) {
             Ok(status) if status.success() => {}
-            Ok(status) => return Err(RunError::Exit(status.code())),
+            Ok(status) => {
+                if out.agent_gave_up.load(Ordering::Relaxed) {
+                    out.error(AGENT_HINT);
+                }
+                return Err(RunError::Exit(status.code()));
+            }
             Err(RunError::Cancelled) => {
                 out.error("Cancelled mid-run. Check `kamal lock status`; the deploy lock may need releasing.");
                 return Err(RunError::Cancelled);
@@ -641,6 +675,22 @@ mod tests {
                 (Stream::Out, "healthy: true".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn notices_the_ssh_agent_giving_up() {
+        let (tx, _rx) = mpsc::channel();
+        let runner = Runner::new(tx, Arc::new(|| {}));
+        let out = Output::new(runner.clone(), "t:4".into(), None);
+        let cancel = AtomicBool::new(false);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'Running docker login on 10.0.0.25'"]);
+        run_process(&out, cmd, &cancel).ok().unwrap();
+        assert!(!out.agent_gave_up.load(Ordering::Relaxed));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", r#"echo 'ERROR (FrozenError): Exception while executing on host 10.0.0.25: can'"'"'t modify frozen String: ""' >&2"#]);
+        run_process(&out, cmd, &cancel).ok().unwrap();
+        assert!(out.agent_gave_up.load(Ordering::Relaxed));
     }
 
     #[test]
