@@ -733,6 +733,18 @@ fn own_container(unit: &Unit, c: &Container) -> bool {
 /// wouldn't do: sh exits when an exec fails.
 const SHELL: &str = "sh -c 'command -v bash >/dev/null && exec bash || exec sh'";
 
+/// `kamal app exec` into one running app container. With both `--hosts` and
+/// `--roles`, kamal takes that host as the primary one and that role as the
+/// primary role, so `--reuse` execs into exactly that container.
+fn container_shell_args(host: &str, role: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["app", "exec", "-i", "--reuse", "--hosts", host].map(String::from).to_vec();
+    if let Some(role) = role {
+        args.extend(["--roles".to_string(), role.to_string()]);
+    }
+    args.push(SHELL.to_string());
+    args
+}
+
 fn interactive(cmd: &str) -> bool {
     let words: Vec<&str> = cmd.split_whitespace().collect();
     words.contains(&"exec") && (words.contains(&"-i") || words.contains(&"--interactive"))
@@ -945,8 +957,6 @@ fn config_url(unit: &Unit, cx: &UnitCtx) -> Option<String> {
     Some(format!("{repo}/blob/{}/{file}", cx.sha.as_deref().unwrap_or(&cx.branch)))
 }
 
-/// Width every row reserves on the right for a ⋯ menu.
-const MENU_SLOT: f32 = 28.0;
 /// Fixed columns, so rows line up within and across services.
 const ROLE_COL: f32 = 120.0;
 const VERSION_COL: f32 = 72.0;
@@ -1019,11 +1029,20 @@ fn containers(
                 host,
                 state: c.status.clone(),
                 logs: true,
-                accessory: None,
+                menu: RowMenu::App { busy: cx.busy },
             },
         );
         if click.logs {
             logs(requests, host, c);
+        }
+        if click.shell {
+            let role = c.role.as_deref();
+            requests.push(Request::Do(Intent::Terminal {
+                project: cx.project.to_string(),
+                unit_id: unit.id.clone(),
+                args: container_shell_args(host, role),
+                title: format!("{}@{host} shell", role.unwrap_or("app")),
+            }));
         }
     }
     for (name, host, c) in &live.accessories {
@@ -1050,7 +1069,7 @@ fn containers(
                 None => "not running".into(),
             },
             logs: c.is_some(),
-            accessory: Some(AccessoryMenu { exists: exists || unknown, running, busy: cx.busy, unknown }),
+            menu: RowMenu::Accessory(AccessoryMenu { exists: exists || unknown, running, busy: cx.busy, unknown }),
         };
         let click = container_row(ui, p, stripes, line);
         if click.logs
@@ -1092,7 +1111,7 @@ struct AccessoryMenu {
 struct BlockClick {
     logs: bool,
     accessory: Option<AccessoryVerb>,
-    /// Open a shell in the accessory's container.
+    /// Open a shell in this row's container.
     shell: bool,
 }
 
@@ -1156,8 +1175,16 @@ struct ContainerLine<'a> {
     /// Docker's state, e.g. "Up 2 hours (healthy)".
     state: String,
     logs: bool,
-    /// Accessories get their own actions menu.
-    accessory: Option<AccessoryMenu>,
+    menu: RowMenu,
+}
+
+/// The ⋯ menu at the end of a container line.
+enum RowMenu {
+    /// A running app container: a shell in it.
+    App {
+        busy: bool,
+    },
+    Accessory(AccessoryMenu),
 }
 
 /// One container in a service's block: role or accessory, version and
@@ -1167,11 +1194,26 @@ fn container_row(ui: &mut Ui, p: &Palette, stripes: &mut Stripes, line: Containe
     striped(ui, stripes, |ui| {
         // Right side first so the commit subject can truncate to what's left.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            match &line.accessory {
-                None => {
-                    ui.allocate_exact_size(vec2(MENU_SLOT, 22.0), egui::Sense::hover());
+            match &line.menu {
+                RowMenu::App { busy } => {
+                    theme::more_menu(ui, &format!("Actions for {} on {}", line.name, line.host), |ui| {
+                        if *busy {
+                            ui.label(theme::caption("A run is in progress. Actions are available when it finishes."));
+                            ui.separator();
+                        }
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui
+                                .button("Open shell")
+                                .on_hover_text(format!("bash (or sh) in {}", line.hover))
+                                .clicked()
+                            {
+                                click.shell = true;
+                                ui.close();
+                            }
+                        });
+                    })
                 }
-                Some(menu) => theme::more_menu(ui, &format!("Actions for {}", line.name), |ui| {
+                RowMenu::Accessory(menu) => theme::more_menu(ui, &format!("Actions for {}", line.name), |ui| {
                     if menu.busy {
                         ui.label(theme::caption("A run is in progress. Actions are available when it finishes."));
                         ui.separator();
@@ -1727,5 +1769,22 @@ mod branch_menu_tests {
         let (_, texts) = frame(&ctx, &d, vec![]);
         let (pick, _) = click(&ctx, &d, find(&texts, "develop (default)").center());
         assert_eq!(pick, Some(None));
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn container_shell_targets_host_and_role() {
+        assert_eq!(
+            container_shell_args("10.0.0.24", Some("horizon")),
+            ["app", "exec", "-i", "--reuse", "--hosts", "10.0.0.24", "--roles", "horizon", SHELL]
+        );
+        assert_eq!(
+            container_shell_args("10.0.0.24", None),
+            ["app", "exec", "-i", "--reuse", "--hosts", "10.0.0.24", SHELL]
+        );
     }
 }
